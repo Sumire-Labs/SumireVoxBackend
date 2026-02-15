@@ -19,6 +19,7 @@ load_dotenv()
 DISCORD_CLIENT_ID = os.environ["DISCORD_CLIENT_ID"]
 DISCORD_CLIENT_SECRET = os.environ["DISCORD_CLIENT_SECRET"]
 DISCORD_REDIRECT_URI = os.environ["DISCORD_REDIRECT_URI"]  # 例: https://api.sumirevox.com/auth/discord/callback
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 SESSION_SECRET = os.environ["SESSION_SECRET"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
@@ -26,13 +27,43 @@ COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
 FRONTEND_AFTER_LOGIN_URL = os.environ.get("FRONTEND_AFTER_LOGIN_URL", "https://sumirevox.com/")
 SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "7"))
 
+# Discord permissions
+ADMINISTRATOR = 0x8
+MANAGE_GUILD = 0x20
+
+# Caching for Discord API
+# token -> (timestamp, guilds_list)
+GUILDS_CACHE = {}
+GUILDS_CACHE_TTL = 30  # seconds
+
+# Bot guilds cache (to check bot presence)
+BOT_GUILDS_CACHE = None
+BOT_GUILDS_CACHE_TS = None
+BOT_GUILDS_CACHE_TTL = 60  # seconds
+
+DEFAULT_SETTINGS = {
+    "auto_join": False,
+    "auto_join_config": {},
+    "max_chars": 50,
+    "read_vc_status": False,
+    "read_mention": True,
+    "read_emoji": True,
+    "add_suffix": False,
+    "read_romaji": False,
+    "read_attachments": True,
+    "skip_code_blocks": True,
+    "skip_urls": True,
+}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db(DATABASE_URL)
+    app.state.http_client = httpx.AsyncClient(timeout=20)
     try:
         yield
     finally:
+        await app.state.http_client.aclose()
         await db.close_db()
 
 
@@ -138,6 +169,7 @@ async def discord_callback(request: Request):
         sid=sid,
         discord_user_id=str(me["id"]),
         username=me.get("username"),
+        access_token=access_token,
         expires_at=expires_at,
     )
 
@@ -182,3 +214,189 @@ async def logout(request: Request):
         await db.delete_session(sid)
 
     return res
+
+
+async def get_current_session(request: Request) -> db.WebSession:
+    sid = _verify_signed(request.cookies.get("sid"))
+    if not sid:
+        raise HTTPException(status_code=401, detail="Not logged in")
+
+    sess = await db.get_session_by_sid(sid)
+    if not sess:
+        raise HTTPException(status_code=401, detail="Not logged in")
+
+    return sess
+
+
+async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> list:
+    """
+    Fetch guilds from Discord or cache.
+    """
+    now = datetime.now()
+    if access_token in GUILDS_CACHE:
+        ts, guilds = GUILDS_CACHE[access_token]
+        if (now - ts).total_seconds() < GUILDS_CACHE_TTL:
+            return guilds
+
+    res = await client.get(
+        "https://discord.com/api/users/@me/guilds",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail=f"Failed to fetch guilds from Discord: {res.text}")
+
+    guilds = res.json()
+    GUILDS_CACHE[access_token] = (now, guilds)
+    return guilds
+
+
+async def fetch_bot_guilds(client: httpx.AsyncClient) -> list:
+    """
+    Fetch guilds where the bot is present.
+    """
+    global BOT_GUILDS_CACHE, BOT_GUILDS_CACHE_TS
+    if not DISCORD_BOT_TOKEN:
+        return []
+
+    now = datetime.now()
+    if BOT_GUILDS_CACHE is not None and BOT_GUILDS_CACHE_TS:
+        if (now - BOT_GUILDS_CACHE_TS).total_seconds() < BOT_GUILDS_CACHE_TTL:
+            return BOT_GUILDS_CACHE
+
+    # Bot as user guilds
+    res = await client.get(
+        "https://discord.com/api/users/@me/guilds",
+        headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+    )
+    if res.status_code != 200:
+        # If it fails, we might just return the cached version or empty list
+        if BOT_GUILDS_CACHE is not None:
+            return BOT_GUILDS_CACHE
+        return []
+
+    guilds = res.json()
+    BOT_GUILDS_CACHE = [g["id"] for g in guilds]
+    BOT_GUILDS_CACHE_TS = now
+    return BOT_GUILDS_CACHE
+
+
+async def is_bot_in_guild(client: httpx.AsyncClient, guild_id: int) -> bool:
+    bot_guild_ids = await fetch_bot_guilds(client)
+    return str(guild_id) in [str(gid) for gid in bot_guild_ids]
+
+
+async def require_manage_guild_permission(
+    request: Request,
+    sess: db.WebSession,
+    guild_id: int,
+) -> None:
+    """
+    Discordの /users/@me/guilds に含まれる permissions を見て、
+    対象guildで manage_guild(0x20) を持っている場合のみ許可する。
+    """
+    client: httpx.AsyncClient = request.app.state.http_client
+    user_guilds = await fetch_user_guilds(client, sess.access_token)
+
+    target = next((g for g in user_guilds if str(g.get("id")) == str(guild_id)), None)
+    if not target:
+        # 所属していない（または見えない）guild
+        raise HTTPException(status_code=403, detail="Missing guild access")
+
+    perms = int(target.get("permissions", 0))
+    is_owner = target.get("owner", False)
+    if not is_owner and (perms & MANAGE_GUILD) != MANAGE_GUILD and (perms & ADMINISTRATOR) != ADMINISTRATOR:
+        raise HTTPException(status_code=403, detail="Missing manage_guild permission")
+
+
+@app.get("/api/guilds")
+async def get_guilds(request: Request):
+    sess = await get_current_session(request)
+
+    client: httpx.AsyncClient = request.app.state.http_client
+
+    # ユーザーの所属ギルド取得
+    user_guilds = await fetch_user_guilds(client, sess.access_token)
+
+    # manage_guild を持つギルドのみ抽出 (MANAGE_GUILD = 0x20)
+    # または ADMINISTRATOR = 0x8, またはオーナー
+    manageable_guilds = [
+        {
+            "id": g["id"],
+            "name": g["name"],
+            "icon": g["icon"],
+            "permissions": g["permissions"],
+        }
+        for g in user_guilds
+        if g.get("owner", False) or 
+           (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or 
+           (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
+    ]
+
+    return manageable_guilds
+
+
+@app.get("/api/guilds/{guild_id}/settings")
+async def get_settings(guild_id: int, request: Request):
+    sess = await get_current_session(request)
+    await require_manage_guild_permission(request, sess, guild_id)
+
+    settings = await db.get_guild_settings(guild_id)
+    if not settings:
+        # Check if bot is in guild
+        client: httpx.AsyncClient = request.app.state.http_client
+        if await is_bot_in_guild(client, guild_id):
+            return DEFAULT_SETTINGS
+        else:
+            # Bot not in guild, return empty to trigger invite screen
+            return {}
+    return settings
+
+
+@app.patch("/api/guilds/{guild_id}/settings")
+async def update_settings(guild_id: int, request: Request):
+    sess = await get_current_session(request)
+    await require_manage_guild_permission(request, sess, guild_id)
+
+    new_settings = await request.json()
+    await db.update_guild_settings(guild_id, new_settings)
+    return {"ok": True}
+
+
+@app.get("/api/guilds/{guild_id}/dict")
+async def get_dict(guild_id: int, request: Request):
+    sess = await get_current_session(request)
+    await require_manage_guild_permission(request, sess, guild_id)
+
+    d = await db.get_guild_dict(guild_id)
+    # フロントエンドは [{word, reading}] のリストを期待している
+    return [{"word": k, "reading": v} for k, v in d.items()]
+
+
+@app.post("/api/guilds/{guild_id}/dict")
+async def add_dict(guild_id: int, request: Request):
+    sess = await get_current_session(request)
+    await require_manage_guild_permission(request, sess, guild_id)
+
+    payload = await request.json()
+    word = payload.get("word")
+    reading = payload.get("reading")
+
+    if not word or not reading:
+        raise HTTPException(status_code=400, detail="word and reading are required")
+
+    d = await db.get_guild_dict(guild_id)
+    d[word] = reading
+    await db.update_guild_dict(guild_id, d)
+    return {"ok": True}
+
+
+@app.delete("/api/guilds/{guild_id}/dict/{word}")
+async def delete_dict(guild_id: int, word: str, request: Request):
+    sess = await get_current_session(request)
+    await require_manage_guild_permission(request, sess, guild_id)
+
+    d = await db.get_guild_dict(guild_id)
+    if word in d:
+        del d[word]
+        await db.update_guild_dict(guild_id, d)
+    return {"ok": True}
