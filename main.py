@@ -6,6 +6,7 @@ from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
+import stripe
 from dotenv import load_dotenv
 
 import httpx
@@ -23,6 +24,13 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 SESSION_SECRET = os.environ["SESSION_SECRET"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
+
+STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+DOMAIN = os.environ.get("DOMAIN", "http://localhost:5173")
+
+stripe.api_key = STRIPE_API_KEY
 
 FRONTEND_AFTER_LOGIN_URL = os.environ.get("FRONTEND_AFTER_LOGIN_URL", "https://sumirevox.com/")
 SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "7"))
@@ -335,6 +343,38 @@ async def get_guilds(request: Request):
     return manageable_guilds
 
 
+@app.get("/api/billing/status")
+async def get_billing_status(request: Request):
+    sess = await get_current_session(request)
+    
+    status = await db.get_user_billing(sess.discord_user_id)
+    if not status:
+        return {
+            "total_slots": 0,
+            "used_slots": 0,
+            "boosts": []
+        }
+    
+    # ギルド名の解決（フロントエンドでの表示用）
+    client: httpx.AsyncClient = request.app.state.http_client
+    user_guilds = await fetch_user_guilds(client, sess.access_token)
+    guild_map = {str(g["id"]): g["name"] for g in user_guilds}
+    
+    boosts_with_names = []
+    for b in status.get("boosts", []):
+        guild_id_str = str(b["guild_id"])
+        boosts_with_names.append({
+            "guild_id": guild_id_str,
+            "guild_name": guild_map.get(guild_id_str, "Unknown Server")
+        })
+    
+    return {
+        "total_slots": status.get("total_slots", 0),
+        "used_slots": len(status.get("boosts", [])),
+        "boosts": boosts_with_names
+    }
+
+
 @app.get("/api/guilds/{guild_id}/settings")
 async def get_settings(guild_id: int, request: Request):
     sess = await get_current_session(request)
@@ -400,3 +440,81 @@ async def delete_dict(guild_id: int, word: str, request: Request):
         del d[word]
         await db.update_guild_dict(guild_id, d)
     return {"ok": True}
+
+
+# --- Billing (Stripe) ---
+
+@app.post("/api/billing/create-checkout-session")
+async def create_checkout_session(request: Request):
+    sess = await get_current_session(request)
+    
+    try:
+        # ユーザーが存在するか確認、なければ作成
+        await db.create_or_update_user(sess.discord_user_id)
+        
+        # すでに Stripe Customer ID があるか取得
+        user_billing = await db.get_user_billing(sess.discord_user_id)
+        customer_id = user_billing.get("stripe_customer_id") if user_billing else None
+
+        checkout_session = stripe.checkout.session.create(
+            customer=customer_id,
+            line_items=[
+                {
+                    "price": STRIPE_PRICE_ID,
+                    "quantity": 1,
+                },
+            ],
+            mode="subscription",
+            success_url=f"{DOMAIN}/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{DOMAIN}/dashboard",
+            metadata={
+                "discord_id": sess.discord_user_id
+            },
+            subscription_data={
+                "metadata": {
+                    "discord_id": sess.discord_user_id
+                }
+            }
+        )
+        return {"url": checkout_session.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/billing/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError:
+        # Invalid payload
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        # Invalid signature
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    # Handle the event
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        discord_id = session.get("metadata", {}).get("discord_id")
+        customer_id = session.get("customer")
+        
+        if discord_id and customer_id:
+            # ユーザーとカスタマーIDを紐付け
+            await db.create_or_update_user(discord_id, customer_id)
+            # スロットを加算 (とりあえず1つにつき1スロットとする)
+            # 実際には購入数に応じるが、ここではシンプルに1
+            await db.add_user_slots(customer_id, 1)
+
+    elif event["type"] == "customer.subscription.deleted":
+        subscription = event["data"]["object"]
+        customer_id = subscription.get("customer")
+        if customer_id:
+            # サブスク解除時はスロットを0にし、ブーストを解除
+            await db.reset_user_slots_by_customer(customer_id)
+
+    return {"status": "success"}

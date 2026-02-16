@@ -80,6 +80,21 @@ async def init_db(database_url: str) -> None:
                   guild_id BIGINT PRIMARY KEY,
                   dict JSONB NOT NULL DEFAULT '{}'
                 );
+
+                CREATE TABLE IF NOT EXISTS users (
+                  discord_id TEXT PRIMARY KEY,
+                  stripe_customer_id TEXT UNIQUE,
+                  total_slots INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS guild_boosts (
+                  id SERIAL PRIMARY KEY,
+                  guild_id BIGINT NOT NULL,
+                  user_id TEXT NOT NULL REFERENCES users(discord_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_guild_boosts_guild_id ON guild_boosts(guild_id);
+                CREATE INDEX IF NOT EXISTS idx_guild_boosts_user_id ON guild_boosts(user_id);
                 """
             )
 
@@ -243,3 +258,87 @@ async def update_guild_dict(guild_id: int, dict_data: dict) -> None:
             guild_id,
             dict_json,
         )
+
+
+# --- Billing (Stripe) ---
+
+async def get_user_billing(discord_id: str) -> dict | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT discord_id, stripe_customer_id, total_slots
+            FROM users
+            WHERE discord_id = $1
+            """,
+            discord_id,
+        )
+        if not row:
+            return None
+        
+        boosts = await conn.fetch(
+            "SELECT id, guild_id, user_id FROM guild_boosts WHERE user_id = $1",
+            discord_id
+        )
+        
+        return {
+            "discord_id": row["discord_id"],
+            "stripe_customer_id": row["stripe_customer_id"],
+            "total_slots": row["total_slots"],
+            "boosts": [dict(b) for b in boosts]
+        }
+
+
+async def create_or_update_user(discord_id: str, stripe_customer_id: str | None = None) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        if stripe_customer_id:
+            await conn.execute(
+                """
+                INSERT INTO users (discord_id, stripe_customer_id)
+                VALUES ($1, $2)
+                ON CONFLICT (discord_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id
+                """,
+                discord_id,
+                stripe_customer_id,
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO users (discord_id)
+                VALUES ($1)
+                ON CONFLICT (discord_id) DO NOTHING
+                """,
+                discord_id,
+            )
+
+
+async def add_user_slots(stripe_customer_id: str, count: int) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET total_slots = total_slots + $1
+            WHERE stripe_customer_id = $2
+            """,
+            count,
+            stripe_customer_id,
+        )
+
+
+async def reset_user_slots_by_customer(stripe_customer_id: str) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        # Get discord_id first to delete boosts
+        discord_id = await conn.fetchval(
+            "SELECT discord_id FROM users WHERE stripe_customer_id = $1",
+            stripe_customer_id
+        )
+        if discord_id:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM guild_boosts WHERE user_id = $1", discord_id)
+                await conn.execute(
+                    "UPDATE users SET total_slots = 0 WHERE discord_id = $1",
+                    discord_id
+                )

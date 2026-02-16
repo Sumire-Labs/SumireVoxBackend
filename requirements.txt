@@ -2,3 +2,4 @@ httpx
 python-dotenv
 fastapi
 asyncpg
+stripe
