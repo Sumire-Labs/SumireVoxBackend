@@ -90,8 +90,18 @@ async def init_db(database_url: str) -> None:
                 CREATE TABLE IF NOT EXISTS guild_boosts (
                   id SERIAL PRIMARY KEY,
                   guild_id BIGINT NOT NULL,
-                  user_id TEXT NOT NULL REFERENCES users(discord_id) ON DELETE CASCADE
+                  user_id TEXT NOT NULL REFERENCES users(discord_id) ON DELETE CASCADE,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+
+                -- Migration: add created_at if missing
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                   WHERE table_name='guild_boosts' AND column_name='created_at') THEN
+                        ALTER TABLE guild_boosts ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+                    END IF;
+                END $$;
 
                 CREATE INDEX IF NOT EXISTS idx_guild_boosts_guild_id ON guild_boosts(guild_id);
                 CREATE INDEX IF NOT EXISTS idx_guild_boosts_user_id ON guild_boosts(user_id);
@@ -342,3 +352,29 @@ async def reset_user_slots_by_customer(stripe_customer_id: str) -> None:
                     "UPDATE users SET total_slots = 0 WHERE discord_id = $1",
                     discord_id
                 )
+
+
+async def deactivate_guild_boost(guild_id: int, user_id: str) -> bool:
+    """
+    Remove a boost from a guild for a specific user.
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM guild_boosts WHERE guild_id = $1 AND user_id = $2",
+            guild_id,
+            user_id
+        )
+        return result == "DELETE 1"
+
+
+async def is_guild_boosted(guild_id: int) -> bool:
+    """
+    Check if a guild is boosted.
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM guild_boosts WHERE guild_id = $1)",
+            guild_id
+        )

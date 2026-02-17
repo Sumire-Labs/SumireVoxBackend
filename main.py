@@ -343,6 +343,22 @@ async def get_guilds(request: Request):
     return manageable_guilds
 
 
+@app.post("/api/billing/unboost")
+async def unboost_guild(request: Request):
+    sess = await get_current_session(request)
+    payload = await request.json()
+    guild_id = payload.get("guild_id")
+    
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="guild_id is required")
+    
+    success = await db.deactivate_guild_boost(int(guild_id), sess.discord_user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Boost not found or not owned by you")
+    
+    return {"ok": True}
+
+
 @app.get("/api/billing/status")
 async def get_billing_status(request: Request):
     sess = await get_current_session(request)
