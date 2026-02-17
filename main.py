@@ -2,6 +2,8 @@ import os
 import secrets
 import hmac
 import hashlib
+import logging
+import json
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -15,6 +17,13 @@ from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import src.core.database as db
+
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+)
+logger = logging.getLogger("sumire-vox-backend")
 
 load_dotenv()
 
@@ -210,15 +219,39 @@ async def discord_callback(request: Request):
 
 @app.get("/api/me")
 async def me(request: Request):
-    sid = _verify_signed(request.cookies.get("sid"))
-    if not sid:
-        raise HTTPException(status_code=401, detail="Not logged in")
-
-    sess = await db.get_session_by_sid(sid)
-    if not sess:
-        raise HTTPException(status_code=401, detail="Not logged in")
-
+# ...
     return {"user": {"discordId": sess.discord_user_id, "username": sess.username}}
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint for monitoring.
+    Checks DB connectivity and Stripe API.
+    """
+    health = {"status": "ok", "checks": {}}
+    
+    # DB Check
+    try:
+        db_ok = await db.healthcheck()
+        health["checks"]["database"] = "ok" if db_ok.get("ok") else "error"
+    except Exception as e:
+        health["status"] = "error"
+        health["checks"]["database"] = str(e)
+
+    # Stripe Check
+    try:
+        # Fetching our account info is a good low-overhead check
+        stripe.Account.retrieve()
+        health["checks"]["stripe"] = "ok"
+    except Exception as e:
+        health["status"] = "error"
+        health["checks"]["stripe"] = str(e)
+        
+    if health["status"] != "ok":
+        raise HTTPException(status_code=503, detail=health)
+        
+    return health
 
 
 @app.post("/api/logout")
@@ -523,19 +556,19 @@ async def stripe_webhook(request: Request):
             payload, sig_header, STRIPE_WEBHOOK_SECRET
         )
     except ValueError:
-        print("Webhook error: Invalid payload")
+        logger.error("Webhook error: Invalid payload")
         raise HTTPException(status_code=400, detail="Invalid payload")
     except stripe.error.SignatureVerificationError as e:
-        print(f"Webhook error: Invalid signature ({e})")
+        logger.error(f"Webhook error: Invalid signature ({e})")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     # 冪等性のチェック
     event_id = event["id"]
     if await db.is_event_processed(event_id):
-        print(f"Event {event_id} already processed, skipping.")
+        logger.info(f"Event {event_id} already processed, skipping.")
         return {"status": "success", "info": "already processed"}
 
-    print(f"Stripe Webhook received: {event['type']} (id: {event_id})")
+    logger.info(f"Stripe Webhook received: {event['type']} (id: {event_id})")
 
     # Handle the event
     if event["type"] == "checkout.session.completed":
@@ -543,40 +576,37 @@ async def stripe_webhook(request: Request):
         discord_id = session.get("metadata", {}).get("discord_id")
         customer_id = session.get("customer")
         
-        print(f"Processing checkout.session.completed: discord_id={discord_id}, customer_id={customer_id}")
+        logger.info(f"Processing checkout.session.completed: discord_id={discord_id}, customer_id={customer_id}")
         
         if discord_id and customer_id:
             # ユーザーとカスタマーIDを紐付け
             await db.create_or_update_user(discord_id, customer_id)
             # スロットを加算
             await db.add_user_slots(customer_id, 1)
-            print(f"Successfully updated slots for user {discord_id}")
+            logger.info(f"Successfully updated slots for user {discord_id}")
             await db.mark_event_processed(event_id)
         else:
-            print("Warning: Missing discord_id or customer_id in session metadata")
+            logger.warning("Missing discord_id or customer_id in session metadata")
 
     elif event["type"] == "customer.subscription.deleted":
         subscription = event["data"]["object"]
         customer_id = subscription.get("customer")
-        print(f"Processing customer.subscription.deleted: customer_id={customer_id}")
+        logger.info(f"Processing customer.subscription.deleted: customer_id={customer_id}")
         if customer_id:
             await db.reset_user_slots_by_customer(customer_id)
-            print(f"Successfully reset slots for customer {customer_id}")
+            logger.info(f"Successfully reset slots for customer {customer_id}")
             await db.mark_event_processed(event_id)
 
     elif event["type"] == "charge.refunded":
         charge = event["data"]["object"]
         customer_id = charge.get("customer")
-        print(f"Processing charge.refunded: customer_id={customer_id}")
+        logger.info(f"Processing charge.refunded: customer_id={customer_id}")
         if customer_id:
             res = await db.handle_refund_by_customer(customer_id)
             if res:
-                log_msg = f"Refund handled for user {res['discord_id']}: {res['old_total']} -> {res['new_total']} slots."
-                if res["removed_guilds"]:
-                    log_msg += f" Removed boosts from guilds: {', '.join(res['removed_guilds'])}"
-                print(log_msg)
+                logger.info(f"Refund handled for user {res['discord_id']}: {res['old_total']} -> {res['new_total']} slots. Removed boosts: {res['removed_guilds']}")
                 await db.mark_event_processed(event_id)
             else:
-                print(f"Warning: No user found for customer_id {customer_id} during refund")
+                logger.warning(f"No user found for customer_id {customer_id} during refund")
 
     return {"status": "success"}
