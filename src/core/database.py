@@ -94,6 +94,12 @@ async def init_db(database_url: str) -> None:
                   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
 
+                -- Idempotency for Stripe
+                CREATE TABLE IF NOT EXISTS processed_stripe_events (
+                  event_id TEXT PRIMARY KEY,
+                  processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+
                 -- Migration: add created_at if missing
                 DO $$
                 BEGIN
@@ -352,6 +358,76 @@ async def reset_user_slots_by_customer(stripe_customer_id: str) -> None:
                     "UPDATE users SET total_slots = 0 WHERE discord_id = $1",
                     discord_id
                 )
+
+
+async def handle_refund_by_customer(stripe_customer_id: str) -> dict | None:
+    """
+    Handle a refund: decrement total_slots and remove boosts if they exceed the new total.
+    Returns info about the changes for logging.
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            user = await conn.fetchrow(
+                "SELECT discord_id, total_slots FROM users WHERE stripe_customer_id = $1 FOR UPDATE",
+                stripe_customer_id
+            )
+            if not user:
+                return None
+
+            discord_id = user["discord_id"]
+            new_total = max(0, user["total_slots"] - 1)
+
+            # Update slots
+            await conn.execute(
+                "UPDATE users SET total_slots = $1 WHERE discord_id = $2",
+                new_total, discord_id
+            )
+
+            # Check if we need to remove boosts
+            boosts = await conn.fetch(
+                "SELECT id, guild_id FROM guild_boosts WHERE user_id = $1 ORDER BY created_at DESC",
+                discord_id
+            )
+
+            removed_guilds = []
+            if len(boosts) > new_total:
+                to_remove_count = len(boosts) - new_total
+                to_remove = boosts[:to_remove_count]
+                
+                for b in to_remove:
+                    await conn.execute("DELETE FROM guild_boosts WHERE id = $1", b["id"])
+                    removed_guilds.append(str(b["guild_id"]))
+
+            return {
+                "discord_id": discord_id,
+                "old_total": user["total_slots"],
+                "new_total": new_total,
+                "removed_guilds": removed_guilds
+            }
+
+
+async def is_event_processed(event_id: str) -> bool:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT EXISTS(SELECT 1 FROM processed_stripe_events WHERE event_id = $1)", event_id)
+
+
+async def mark_event_processed(event_id: str) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO processed_stripe_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING", event_id)
+
+
+async def delete_guild_boosts_by_guild(guild_id: int) -> int:
+    """Remove all boosts from a guild (e.g. when bot is kicked)"""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        status = await conn.execute("DELETE FROM guild_boosts WHERE guild_id = $1", guild_id)
+        try:
+            return int(status.split()[-1])
+        except Exception:
+            return 0
 
 
 async def deactivate_guild_boost(guild_id: int, user_id: str) -> bool:

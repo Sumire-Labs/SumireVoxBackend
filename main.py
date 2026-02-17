@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 import src.core.database as db
 
@@ -76,6 +77,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[DOMAIN, "http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _sign(value: str) -> str:
@@ -460,6 +469,11 @@ async def delete_dict(guild_id: int, word: str, request: Request):
 
 # --- Billing (Stripe) ---
 
+@app.get("/api/billing/create-checkout-session")
+async def create_checkout_session_get():
+    raise HTTPException(status_code=405, detail="Checkout session creation requires a POST request. Please use the 'Buy' button in the dashboard.")
+
+
 @app.post("/api/billing/create-checkout-session")
 async def create_checkout_session(request: Request):
     sess = await get_current_session(request)
@@ -472,7 +486,7 @@ async def create_checkout_session(request: Request):
         user_billing = await db.get_user_billing(sess.discord_user_id)
         customer_id = user_billing.get("stripe_customer_id") if user_billing else None
 
-        checkout_session = stripe.checkout.session.create(
+        checkout_session = stripe.checkout.Session.create(
             customer=customer_id,
             line_items=[
                 {
@@ -494,6 +508,8 @@ async def create_checkout_session(request: Request):
         )
         return {"url": checkout_session.url}
     except Exception as e:
+        import traceback
+        traceback.print_exc()  # サーバーのコンソールにエラー詳細を表示
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -507,11 +523,19 @@ async def stripe_webhook(request: Request):
             payload, sig_header, STRIPE_WEBHOOK_SECRET
         )
     except ValueError:
-        # Invalid payload
+        print("Webhook error: Invalid payload")
         raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError:
-        # Invalid signature
+    except stripe.error.SignatureVerificationError as e:
+        print(f"Webhook error: Invalid signature ({e})")
         raise HTTPException(status_code=400, detail="Invalid signature")
+
+    # 冪等性のチェック
+    event_id = event["id"]
+    if await db.is_event_processed(event_id):
+        print(f"Event {event_id} already processed, skipping.")
+        return {"status": "success", "info": "already processed"}
+
+    print(f"Stripe Webhook received: {event['type']} (id: {event_id})")
 
     # Handle the event
     if event["type"] == "checkout.session.completed":
@@ -519,18 +543,40 @@ async def stripe_webhook(request: Request):
         discord_id = session.get("metadata", {}).get("discord_id")
         customer_id = session.get("customer")
         
+        print(f"Processing checkout.session.completed: discord_id={discord_id}, customer_id={customer_id}")
+        
         if discord_id and customer_id:
             # ユーザーとカスタマーIDを紐付け
             await db.create_or_update_user(discord_id, customer_id)
-            # スロットを加算 (とりあえず1つにつき1スロットとする)
-            # 実際には購入数に応じるが、ここではシンプルに1
+            # スロットを加算
             await db.add_user_slots(customer_id, 1)
+            print(f"Successfully updated slots for user {discord_id}")
+            await db.mark_event_processed(event_id)
+        else:
+            print("Warning: Missing discord_id or customer_id in session metadata")
 
     elif event["type"] == "customer.subscription.deleted":
         subscription = event["data"]["object"]
         customer_id = subscription.get("customer")
+        print(f"Processing customer.subscription.deleted: customer_id={customer_id}")
         if customer_id:
-            # サブスク解除時はスロットを0にし、ブーストを解除
             await db.reset_user_slots_by_customer(customer_id)
+            print(f"Successfully reset slots for customer {customer_id}")
+            await db.mark_event_processed(event_id)
+
+    elif event["type"] == "charge.refunded":
+        charge = event["data"]["object"]
+        customer_id = charge.get("customer")
+        print(f"Processing charge.refunded: customer_id={customer_id}")
+        if customer_id:
+            res = await db.handle_refund_by_customer(customer_id)
+            if res:
+                log_msg = f"Refund handled for user {res['discord_id']}: {res['old_total']} -> {res['new_total']} slots."
+                if res["removed_guilds"]:
+                    log_msg += f" Removed boosts from guilds: {', '.join(res['removed_guilds'])}"
+                print(log_msg)
+                await db.mark_event_processed(event_id)
+            else:
+                print(f"Warning: No user found for customer_id {customer_id} during refund")
 
     return {"status": "success"}
