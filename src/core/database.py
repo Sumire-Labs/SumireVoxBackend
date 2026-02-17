@@ -332,15 +332,47 @@ async def create_or_update_user(discord_id: str, stripe_customer_id: str | None 
 async def add_user_slots(stripe_customer_id: str, count: int) -> None:
     pool = _require_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE users
-            SET total_slots = total_slots + $1
-            WHERE stripe_customer_id = $2
-            """,
-            count,
-            stripe_customer_id,
-        )
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE users
+                SET total_slots = total_slots + $1
+                WHERE stripe_customer_id = $2
+                """,
+                count,
+                stripe_customer_id,
+            )
+
+
+async def sync_user_slots(stripe_customer_id: str, total_slots: int) -> None:
+    """Force sync slots to a specific value (used by sync script)"""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            user = await conn.fetchrow(
+                "SELECT discord_id, total_slots FROM users WHERE stripe_customer_id = $1 FOR UPDATE",
+                stripe_customer_id
+            )
+            if not user:
+                return
+
+            discord_id = user["discord_id"]
+            
+            # Update slots
+            await conn.execute(
+                "UPDATE users SET total_slots = $1 WHERE discord_id = $2",
+                total_slots, discord_id
+            )
+
+            # If new total is less than current boosts, remove excess
+            boosts = await conn.fetch(
+                "SELECT id FROM guild_boosts WHERE user_id = $1 ORDER BY created_at DESC",
+                discord_id
+            )
+            if len(boosts) > total_slots:
+                to_remove = boosts[:len(boosts) - total_slots]
+                for b in to_remove:
+                    await conn.execute("DELETE FROM guild_boosts WHERE id = $1", b["id"])
 
 
 async def reset_user_slots_by_customer(stripe_customer_id: str) -> None:
