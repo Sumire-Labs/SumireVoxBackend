@@ -47,6 +47,13 @@ async def init_db(database_url: str) -> None:
             # Ensure tables exist
             await conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS bot_instances (
+                  id SERIAL PRIMARY KEY,
+                  client_id TEXT NOT NULL,
+                  bot_name TEXT NOT NULL,
+                  is_active BOOLEAN NOT NULL DEFAULT true
+                );
+
                 CREATE TABLE IF NOT EXISTS web_sessions (
                   sid TEXT PRIMARY KEY,
                   discord_user_id TEXT NOT NULL,
@@ -464,16 +471,83 @@ async def delete_guild_boosts_by_guild(guild_id: int) -> int:
 
 async def deactivate_guild_boost(guild_id: int, user_id: str) -> bool:
     """
-    Remove a boost from a guild for a specific user.
+    Remove a single boost from a guild for a specific user.
+    Uses CTID to delete only one row if multiple exist.
     """
     pool = _require_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM guild_boosts WHERE guild_id = $1 AND user_id = $2",
-            guild_id,
-            user_id
+        async with conn.transaction():
+            # Get one row's CTID
+            row = await conn.fetchrow(
+                "SELECT ctid FROM guild_boosts WHERE guild_id = $1::BIGINT AND user_id = $2 LIMIT 1 FOR UPDATE",
+                guild_id,
+                user_id
+            )
+            if not row:
+                return False
+            
+            # Delete by CTID
+            result = await conn.execute(
+                "DELETE FROM guild_boosts WHERE ctid = $1",
+                row["ctid"]
+            )
+            return result == "DELETE 1"
+
+
+async def activate_guild_boost(guild_id: int, user_id: str, max_boosts: int = 3) -> bool:
+    """
+    Activate a boost for a guild using a user's slot.
+    Checks for slot availability and existing boosts count.
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # 1. Lock user and check slots
+            user = await conn.fetchrow(
+                "SELECT total_slots FROM users WHERE discord_id = $1 FOR UPDATE",
+                user_id
+            )
+            if not user:
+                return False  # User not found or no slots
+            
+            total_slots = user["total_slots"]
+            
+            # 2. Count used slots by this user
+            used_slots = await conn.fetchval(
+                "SELECT COUNT(*) FROM guild_boosts WHERE user_id = $1",
+                user_id
+            )
+            
+            if used_slots >= total_slots:
+                return False  # No available slots
+            
+            # 3. Check guild boost count (limit check)
+            current_guild_boosts = await conn.fetchval(
+                "SELECT COUNT(*) FROM guild_boosts WHERE guild_id = $1::BIGINT",
+                guild_id
+            )
+            if current_guild_boosts >= max_boosts:
+                return False
+                
+            # 4. Insert boost
+            await conn.execute(
+                "INSERT INTO guild_boosts (guild_id, user_id) VALUES ($1::BIGINT, $2)",
+                guild_id,
+                user_id
+            )
+            return True
+
+
+async def get_guild_boost_count(guild_id: int) -> int:
+    """
+    Get the number of boosts for a guild.
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM guild_boosts WHERE guild_id = $1::BIGINT",
+            guild_id
         )
-        return result == "DELETE 1"
 
 
 async def is_guild_boosted(guild_id: int) -> bool:
@@ -483,6 +557,34 @@ async def is_guild_boosted(guild_id: int) -> bool:
     pool = _require_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM guild_boosts WHERE guild_id = $1)",
+            "SELECT EXISTS(SELECT 1 FROM guild_boosts WHERE guild_id = $1::BIGINT)",
             guild_id
+        )
+
+
+# --- Bot Instances ---
+
+async def get_bot_instances() -> list[dict]:
+    """
+    Fetch all active bot instances from the database.
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, client_id, bot_name, is_active FROM bot_instances WHERE is_active = true ORDER BY id ASC"
+        )
+        return [dict(r) for r in rows]
+
+
+async def add_bot_instance(client_id: str, bot_name: str, is_active: bool = True) -> int:
+    """
+    Add a new bot instance to the database.
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO bot_instances (client_id, bot_name, is_active) VALUES ($1, $2, $3) RETURNING id",
+            client_id,
+            bot_name,
+            is_active
         )

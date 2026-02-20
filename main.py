@@ -27,9 +27,12 @@ logger = logging.getLogger("sumire-vox-backend")
 
 load_dotenv()
 
-DISCORD_CLIENT_ID = os.environ["DISCORD_CLIENT_ID"]
+DISCORD_CLIENT_ID_0 = os.environ.get("DISCORD_CLIENT_ID_0") or os.environ.get("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_ID_1 = os.environ.get("DISCORD_CLIENT_ID_1")
+DISCORD_CLIENT_ID_2 = os.environ.get("DISCORD_CLIENT_ID_2")
+DISCORD_CLIENT_ID = DISCORD_CLIENT_ID_0  # Default to 0 for OAuth
 DISCORD_CLIENT_SECRET = os.environ["DISCORD_CLIENT_SECRET"]
-DISCORD_REDIRECT_URI = os.environ["DISCORD_REDIRECT_URI"]  # 例: https://api.sumirevox.com/auth/discord/callback
+DISCORD_REDIRECT_URI = os.environ["DISCORD_REDIRECT_URI"]
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 SESSION_SECRET = os.environ["SESSION_SECRET"]
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -77,6 +80,19 @@ DEFAULT_SETTINGS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db(DATABASE_URL)
+    
+    # Initialize bot instances if empty (first run migration/setup)
+    instances = await db.get_bot_instances()
+    if not instances and DISCORD_CLIENT_ID_0:
+        logger.info("Initializing bot_instances table with environment values...")
+        # 1台目
+        await db.add_bot_instance(DISCORD_CLIENT_ID_0, "SumireVox #1")
+        # 2台目以降があれば追加
+        if DISCORD_CLIENT_ID_1:
+            await db.add_bot_instance(DISCORD_CLIENT_ID_1, "SumireVox #2")
+        if DISCORD_CLIENT_ID_2:
+            await db.add_bot_instance(DISCORD_CLIENT_ID_2, "SumireVox #3")
+
     app.state.http_client = httpx.AsyncClient(timeout=20)
     try:
         yield
@@ -219,7 +235,7 @@ async def discord_callback(request: Request):
 
 @app.get("/api/me")
 async def me(request: Request):
-# ...
+    sess = await get_current_session(request)
     return {"user": {"discordId": sess.discord_user_id, "username": sess.username}}
 
 
@@ -394,11 +410,26 @@ async def unboost_guild(request: Request):
     if not guild_id:
         raise HTTPException(status_code=400, detail="guild_id is required")
     
-    success = await db.deactivate_guild_boost(int(guild_id), sess.discord_user_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Boost not found or not owned by you")
-    
-    return {"ok": True}
+    try:
+        success = await db.deactivate_guild_boost(int(guild_id), sess.discord_user_id)
+        if not success:
+            logger.warning(f"Unboost failed: No boost found for user {sess.discord_user_id} in guild {guild_id}")
+            raise HTTPException(status_code=404, detail="Boost not found or not owned by you")
+        
+        logger.info(f"User {sess.discord_user_id} successfully unboosted guild {guild_id}")
+        
+        # 最新のステータスを取得して返す（フロント更新のため）
+        status = await db.get_user_billing(sess.discord_user_id)
+        return {
+            "ok": True,
+            "total_slots": status["total_slots"] if status else 0,
+            "used_slots": len(status["boosts"]) if status else 0
+        }
+    except Exception as e:
+        logger.error(f"Error during unboost: {e}")
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/billing/status")
@@ -407,7 +438,7 @@ async def get_billing_status(request: Request):
     
     status = await db.get_user_billing(sess.discord_user_id)
     if not status:
-        return {
+        status = {
             "total_slots": 0,
             "used_slots": 0,
             "boosts": []
@@ -425,12 +456,94 @@ async def get_billing_status(request: Request):
             "guild_id": guild_id_str,
             "guild_name": guild_map.get(guild_id_str, "Unknown Server")
         })
+
+    # 管理可能なサーバー一覧の構築（ボット在席チェックとブースト数カウントを含む）
+    manageable_guilds = []
+    for g in user_guilds:
+        is_manageable = g.get("owner", False) or \
+                         (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or \
+                         (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
+        
+        if is_manageable:
+            guild_id = int(g["id"])
+            boost_count = await db.get_guild_boost_count(guild_id)
+            bot_in_guild = await is_bot_in_guild(client, guild_id)
+            
+            # 特典情報の構築
+            benefits = []
+            if boost_count >= 1:
+                benefits.append("Premium Features")
+            
+            # サブBotの解放状況 (Index i のBotは i + 1 ブースト以上で有効)
+            instances = await db.get_bot_instances()
+            for i, inst in enumerate(instances):
+                if i == 0: continue # メインBot
+                if boost_count >= i + 1:
+                    benefits.append(f"Bot #{i+1} Unlocked")
+            
+            manageable_guilds.append({
+                "id": g["id"],
+                "name": g["name"],
+                "icon": g["icon"],
+                "boost_count": boost_count,
+                "bot_in_guild": bot_in_guild,
+                "benefits": benefits
+            })
     
     return {
         "total_slots": status.get("total_slots", 0),
-        "used_slots": len(status.get("boosts", [])),
-        "boosts": boosts_with_names
+        "used_slots": status.get("used_slots") if "used_slots" in status else len(status.get("boosts", [])),
+        "boosts": boosts_with_names,
+        "manageable_guilds": manageable_guilds
     }
+
+
+@app.get("/api/billing/config")
+async def get_billing_config():
+    instances = await db.get_bot_instances()
+    
+    # 1台目のID
+    client_id_0 = instances[0]["client_id"] if instances else None
+    
+    return {
+        "bot_instances": instances,
+        "client_id_0": client_id_0,
+        "max_boosts_per_guild": len(instances)  # Bot台数を最大数とする
+    }
+
+
+@app.post("/api/billing/boost")
+async def boost_guild(request: Request):
+    sess = await get_current_session(request)
+    payload = await request.json()
+    guild_id = payload.get("guild_id")
+    
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="guild_id is required")
+    
+    # 権限チェック
+    await require_manage_guild_permission(request, sess, int(guild_id))
+    
+    # 現在のBot台数を取得
+    instances = await db.get_bot_instances()
+    max_boosts = len(instances)
+
+    # 最大ブースト数チェック
+    boost_count = await db.get_guild_boost_count(int(guild_id))
+    if boost_count >= max_boosts:
+        raise HTTPException(status_code=400, detail=f"Guild reached max boost limit ({max_boosts})")
+        
+    # スロット空きチェック
+    status = await db.get_user_billing(sess.discord_user_id)
+    if not status or status["total_slots"] <= len(status["boosts"]):
+        raise HTTPException(status_code=400, detail="No available slots")
+        
+    # 適用
+    success = await db.activate_guild_boost(int(guild_id), sess.discord_user_id, max_boosts=max_boosts)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to activate boost (maybe no slots or limit reached)")
+        
+    return {"ok": True}
 
 
 @app.get("/api/guilds/{guild_id}/settings")
