@@ -198,11 +198,12 @@ async def delete_session(sid: str) -> None:
 
 async def cleanup_expired_sessions(limit: int = 1000) -> int:
     """
-    Optional utility: delete expired sessions in batches.
-    Returns deleted row count for this call.
+    Delete expired sessions and old processed stripe events.
+    Returns deleted session count.
     """
     pool = _require_pool()
     async with pool.acquire() as conn:
+        # 1. Cleanup sessions
         status: str = await conn.execute(
             """
             DELETE FROM web_sessions
@@ -216,6 +217,12 @@ async def cleanup_expired_sessions(limit: int = 1000) -> int:
             """,
             limit,
         )
+        
+        # 2. Cleanup old processed_stripe_events (older than 30 days)
+        await conn.execute(
+            "DELETE FROM processed_stripe_events WHERE processed_at < now() - interval '30 days'"
+        )
+
     try:
         return int(status.split()[-1])
     except Exception:
