@@ -601,6 +601,20 @@ async def update_settings(guild_id: int, request: Request):
     await require_manage_guild_permission(request, sess, guild_id)
 
     new_settings = await request.json()
+    
+    # プレミアムチェック (文字数制限)
+    boost_count = await db.get_guild_boost_count(guild_id)
+    if boost_count < 1:
+        # 0ブーストの場合は50文字に強制制限
+        if new_settings.get("max_chars", 0) > 50:
+            new_settings["max_chars"] = 50
+        # 0ブーストの場合は自動接続を強制OFF
+        new_settings["auto_join"] = False
+    else:
+        # 1ブースト以上の場合は200文字に制限
+        if new_settings.get("max_chars", 0) > 200:
+            new_settings["max_chars"] = 200
+
     await db.update_guild_settings(guild_id, new_settings)
     return {"ok": True}
 
@@ -628,6 +642,17 @@ async def add_dict(guild_id: int, request: Request):
         raise HTTPException(status_code=400, detail="word and reading are required")
 
     d = await db.get_guild_dict(guild_id)
+    
+    # プレミアムチェック (辞書登録数)
+    boost_count = await db.get_guild_boost_count(guild_id)
+    limit = 100 if boost_count >= 1 else 10
+    
+    if len(d) >= limit and word not in d:
+        raise HTTPException(
+            status_code=403, 
+            detail=f"Dictionary limit reached ({limit}). Upgrade to premium for more slots."
+        )
+
     d[word] = reading
     await db.update_guild_dict(guild_id, d)
     return {"ok": True}
