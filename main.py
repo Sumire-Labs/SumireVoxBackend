@@ -512,14 +512,15 @@ async def get_billing_status(request: Request):
                 if boost_count >= i + 1:
                     benefits.append(f"Bot #{i+1} Unlocked")
             
-            manageable_guilds.append({
-                "id": g["id"],
-                "name": g["name"],
-                "icon": g["icon"],
-                "boost_count": boost_count,
-                "bot_in_guild": bot_in_guild,
-                "benefits": benefits
-            })
+            if bot_in_guild or boost_count > 0:
+                manageable_guilds.append({
+                    "id": g["id"],
+                    "name": g["name"],
+                    "icon": g["icon"],
+                    "boost_count": boost_count,
+                    "bot_in_guild": bot_in_guild,
+                    "benefits": benefits
+                })
     
     return {
         "total_slots": status.get("total_slots", 0),
