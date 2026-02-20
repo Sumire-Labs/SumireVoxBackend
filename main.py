@@ -6,6 +6,9 @@ import hmac
 import hashlib
 import logging
 import json
+import asyncio
+import gc
+import psutil
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -57,7 +60,7 @@ MANAGE_GUILD = 0x20
 
 # Caching for Discord API
 # token -> guilds_list
-GUILDS_CACHE = TTLCache(maxsize=1000, ttl=30)
+GUILDS_CACHE = TTLCache(maxsize=200, ttl=30)
 
 # Bot guilds cache (to check bot presence)
 BOT_GUILDS_CACHE = None
@@ -79,6 +82,36 @@ DEFAULT_SETTINGS = {
 }
 
 
+async def background_cleanup():
+    """定期的に実行するクリーンアップタスク"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # 5分ごとに実行
+            logger.info("定期クリーンアップを開始します...")
+
+            # 1. BOT_GUILDS_CACHE の期限切れチェックとクリア
+            global BOT_GUILDS_CACHE, BOT_GUILDS_CACHE_TS
+            now = datetime.now()
+            if BOT_GUILDS_CACHE_TS and (now - BOT_GUILDS_CACHE_TS).total_seconds() >= BOT_GUILDS_CACHE_TTL:
+                logger.info("BOT_GUILDS_CACHE をクリアしました。")
+                BOT_GUILDS_CACHE = None
+                BOT_GUILDS_CACHE_TS = None
+
+            # 2. 期限切れセッションと古い Stripe イベントの削除
+            deleted_sessions = await db.cleanup_expired_sessions()
+            if deleted_sessions > 0:
+                logger.info(f"期限切れのセッションを {deleted_sessions} 件削除しました。")
+
+            # 3. ガベージコレクションの強制実行
+            gc.collect()
+            logger.info("定期クリーンアップが完了しました。")
+        except asyncio.CancelledError:
+            logger.info("定期クリーンアップタスクを停止します。")
+            break
+        except Exception as e:
+            logger.error(f"定期クリーンアップ中にエラーが発生しました: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db(DATABASE_URL)
@@ -95,10 +128,14 @@ async def lifespan(app: FastAPI):
         if DISCORD_CLIENT_ID_2:
             await db.add_bot_instance(DISCORD_CLIENT_ID_2, "SumireVox #3")
 
+    # バックグラウンドタスクの起動
+    cleanup_task = asyncio.create_task(background_cleanup())
+
     app.state.http_client = httpx.AsyncClient(timeout=20)
     try:
         yield
     finally:
+        cleanup_task.cancel()
         await app.state.http_client.aclose()
         await db.close_db()
 
@@ -241,35 +278,19 @@ async def me(request: Request):
     return {"user": {"discordId": sess.discord_user_id, "username": sess.username}}
 
 
-@app.get("/health")
-async def health_check():
-    """
-    Health check endpoint for monitoring.
-    Checks DB connectivity and Stripe API.
-    """
-    health = {"status": "ok", "checks": {}}
+@app.get("/health/memory")
+async def health_memory():
+    """メモリ使用状況を確認するエンドポイント"""
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
     
-    # DB Check
-    try:
-        db_ok = await db.healthcheck()
-        health["checks"]["database"] = "ok" if db_ok.get("ok") else "error"
-    except Exception as e:
-        health["status"] = "error"
-        health["checks"]["database"] = str(e)
-
-    # Stripe Check
-    try:
-        # Fetching our account info is a good low-overhead check
-        stripe.Account.retrieve()
-        health["checks"]["stripe"] = "ok"
-    except Exception as e:
-        health["status"] = "error"
-        health["checks"]["stripe"] = str(e)
-        
-    if health["status"] != "ok":
-        raise HTTPException(status_code=503, detail=health)
-        
-    return health
+    return {
+        "rss": f"{mem_info.rss / 1024 / 1024:.2f} MB",
+        "vms": f"{mem_info.vms / 1024 / 1024:.2f} MB",
+        "guilds_cache_size": len(GUILDS_CACHE),
+        "bot_guilds_cache_size": len(BOT_GUILDS_CACHE) if BOT_GUILDS_CACHE else 0,
+        "gc_objects_count": len(gc.get_objects())
+    }
 
 
 @app.post("/api/logout")
@@ -311,8 +332,19 @@ async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> lis
         raise HTTPException(status_code=res.status_code, detail=f"Failed to fetch guilds from Discord: {res.text}")
 
     guilds = res.json()
-    GUILDS_CACHE[access_token] = guilds
-    return guilds
+    # 必要なフィールドのみに絞る（id, name, icon, permissions, owner）
+    minimal_guilds = [
+        {
+            "id": g.get("id"),
+            "name": g.get("name"),
+            "icon": g.get("icon"),
+            "permissions": g.get("permissions"),
+            "owner": g.get("owner")
+        }
+        for g in guilds
+    ]
+    GUILDS_CACHE[access_token] = minimal_guilds
+    return minimal_guilds
 
 
 async def fetch_bot_guilds(client: httpx.AsyncClient) -> list:
