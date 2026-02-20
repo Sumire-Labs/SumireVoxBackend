@@ -9,6 +9,8 @@ import asyncio
 
 import asyncpg
 
+from src.core.crypto import encrypt, decrypt
+
 
 @dataclass(frozen=True, slots=True)
 class WebSession:
@@ -137,6 +139,9 @@ async def close_db() -> None:
 
 async def create_session(*, sid: str, discord_user_id: str, username: str | None, access_token: str | None, expires_at: datetime) -> None:
     pool = _require_pool()
+    # トークンを暗号化
+    encrypted_token = encrypt(access_token) if access_token else None
+
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -146,7 +151,7 @@ async def create_session(*, sid: str, discord_user_id: str, username: str | None
             sid,
             discord_user_id,
             username,
-            access_token,
+            encrypted_token,
             expires_at,
         )
 
@@ -180,7 +185,7 @@ async def get_session_by_sid(sid: str) -> WebSession | None:
         sid=row["sid"],
         discord_user_id=row["discord_user_id"],
         username=row["username"],
-        access_token=row["access_token"],
+        access_token=decrypt(row["access_token"]) if row["access_token"] else None,
         expires_at=expires_at,
     )
 
