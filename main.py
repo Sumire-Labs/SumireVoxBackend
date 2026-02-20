@@ -416,18 +416,23 @@ async def get_guilds(request: Request):
 
     # manage_guild を持つギルドのみ抽出 (MANAGE_GUILD = 0x20)
     # または ADMINISTRATOR = 0x8, またはオーナー
-    manageable_guilds = [
-        {
-            "id": g["id"],
-            "name": g["name"],
-            "icon": g["icon"],
-            "permissions": g["permissions"],
-        }
-        for g in user_guilds
-        if g.get("owner", False) or 
-           (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or 
-           (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
-    ]
+    manageable_guilds = []
+    for g in user_guilds:
+        is_manageable = g.get("owner", False) or \
+                         (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or \
+                         (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
+        
+        if is_manageable:
+            guild_id = int(g["id"])
+            bot_in_guild = await is_bot_in_guild(client, guild_id)
+            
+            manageable_guilds.append({
+                "id": g["id"],
+                "name": g["name"],
+                "icon": g["icon"],
+                "permissions": g["permissions"],
+                "bot_in_guild": bot_in_guild
+            })
 
     return manageable_guilds
 
@@ -442,6 +447,8 @@ async def unboost_guild(request: Request):
         raise HTTPException(status_code=400, detail="guild_id is required")
     
     try:
+        # 解除権限の確認: 自分のブーストであれば解除可能なので、
+        # ここで特別な権限チェックは不要（deactivate_guild_boostが自分のものかチェックする）
         success = await db.deactivate_guild_boost(int(guild_id), sess.discord_user_id)
         if not success:
             logger.warning(f"Unboost failed: No boost found for user {sess.discord_user_id} in guild {guild_id}")
@@ -491,14 +498,16 @@ async def get_billing_status(request: Request):
     # 管理可能なサーバー一覧の構築（ボット在席チェックとブースト数カウントを含む）
     manageable_guilds = []
     for g in user_guilds:
-        is_manageable = g.get("owner", False) or \
-                         (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or \
-                         (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
+        guild_id = int(g["id"])
+        boost_count = await db.get_guild_boost_count(guild_id)
+        bot_in_guild = await is_bot_in_guild(client, guild_id)
         
-        if is_manageable:
-            guild_id = int(g["id"])
-            boost_count = await db.get_guild_boost_count(guild_id)
-            bot_in_guild = await is_bot_in_guild(client, guild_id)
+        # 表示条件: 1. Botが導入されている 2. 既にブーストされている
+        # プレミアムダッシュボードでは管理権限がなくてもBotがいれば表示する
+        if bot_in_guild or boost_count > 0:
+            is_manageable = g.get("owner", False) or \
+                             (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or \
+                             (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
             
             # 特典情報の構築
             benefits = []
@@ -512,15 +521,15 @@ async def get_billing_status(request: Request):
                 if boost_count >= i + 1:
                     benefits.append(f"Bot #{i+1} Unlocked")
             
-            if bot_in_guild or boost_count > 0:
-                manageable_guilds.append({
-                    "id": g["id"],
-                    "name": g["name"],
-                    "icon": g["icon"],
-                    "boost_count": boost_count,
-                    "bot_in_guild": bot_in_guild,
-                    "benefits": benefits
-                })
+            manageable_guilds.append({
+                "id": g["id"],
+                "name": g["name"],
+                "icon": g["icon"],
+                "boost_count": boost_count,
+                "bot_in_guild": bot_in_guild,
+                "benefits": benefits,
+                "is_manageable": is_manageable # 権限情報も追加してフロントで制御しやすくする
+            })
     
     return {
         "total_slots": status.get("total_slots", 0),
@@ -553,8 +562,13 @@ async def boost_guild(request: Request):
     if not guild_id:
         raise HTTPException(status_code=400, detail="guild_id is required")
     
-    # 権限チェック
-    await require_manage_guild_permission(request, sess, int(guild_id))
+    # 権限チェックの緩和: 管理権限がなくても、Botが導入されていればブースト可能とする
+    client: httpx.AsyncClient = request.app.state.http_client
+    bot_in_guild = await is_bot_in_guild(client, int(guild_id))
+    
+    if not bot_in_guild:
+        # Botがいない場合は、管理権限が必要
+        await require_manage_guild_permission(request, sess, int(guild_id))
     
     # 現在のBot台数を取得
     instances = await db.get_bot_instances()
