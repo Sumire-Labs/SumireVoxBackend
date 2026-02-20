@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 import stripe
 from dotenv import load_dotenv
+from cachetools import TTLCache
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -55,9 +56,8 @@ ADMINISTRATOR = 0x8
 MANAGE_GUILD = 0x20
 
 # Caching for Discord API
-# token -> (timestamp, guilds_list)
-GUILDS_CACHE = {}
-GUILDS_CACHE_TTL = 30  # seconds
+# token -> guilds_list
+GUILDS_CACHE = TTLCache(maxsize=1000, ttl=30)
 
 # Bot guilds cache (to check bot presence)
 BOT_GUILDS_CACHE = None
@@ -300,11 +300,8 @@ async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> lis
     """
     Fetch guilds from Discord or cache.
     """
-    now = datetime.now()
     if access_token in GUILDS_CACHE:
-        ts, guilds = GUILDS_CACHE[access_token]
-        if (now - ts).total_seconds() < GUILDS_CACHE_TTL:
-            return guilds
+        return GUILDS_CACHE[access_token]
 
     res = await client.get(
         "https://discord.com/api/users/@me/guilds",
@@ -314,7 +311,7 @@ async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> lis
         raise HTTPException(status_code=res.status_code, detail=f"Failed to fetch guilds from Discord: {res.text}")
 
     guilds = res.json()
-    GUILDS_CACHE[access_token] = (now, guilds)
+    GUILDS_CACHE[access_token] = guilds
     return guilds
 
 
