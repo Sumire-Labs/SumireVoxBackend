@@ -1,6 +1,11 @@
-httpx
-python-dotenv
-fastapi
 asyncpg
-stripe
+cachetools
+cryptography
+fastapi
+httpx
+psutil
+python-dotenv
 sqlalchemy
+stripe
+uvicorn
+pytest
