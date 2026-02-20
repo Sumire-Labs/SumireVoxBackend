@@ -1,3 +1,5 @@
+# src/models/billing.py
+
 from sqlalchemy import Column, String, BigInteger, Integer, ForeignKey
 from sqlalchemy.orm import relationship, declarative_base
 

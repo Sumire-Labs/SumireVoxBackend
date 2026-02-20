@@ -1,3 +1,5 @@
+# src/scripts/sync_stripe.py
+
 import os
 import asyncio
 import stripe
