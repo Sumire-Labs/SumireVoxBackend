@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +12,8 @@ import asyncio
 import asyncpg
 
 from src.core.crypto import encrypt, decrypt
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,98 +52,116 @@ async def init_db(database_url: str) -> None:
         _pool = await asyncpg.create_pool(database_url, min_size=1, max_size=10)
 
         async with _pool.acquire() as conn:
-            # Ensure tables exist
             await conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS bot_instances (
-                  id SERIAL PRIMARY KEY,
-                  client_id TEXT NOT NULL,
-                  bot_name TEXT NOT NULL,
-                  is_active BOOLEAN NOT NULL DEFAULT true
+                CREATE TABLE IF NOT EXISTS bot_instances
+                (
+                    id        SERIAL PRIMARY KEY,
+                    client_id TEXT    NOT NULL,
+                    bot_name  TEXT    NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT true
                 );
 
-                CREATE TABLE IF NOT EXISTS web_sessions (
-                  sid TEXT PRIMARY KEY,
-                  discord_user_id TEXT NOT NULL,
-                  username TEXT,
-                  access_token TEXT,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                  expires_at TIMESTAMPTZ NOT NULL
+                CREATE TABLE IF NOT EXISTS web_sessions
+                (
+                    sid             TEXT PRIMARY KEY,
+                    discord_user_id TEXT        NOT NULL,
+                    username        TEXT,
+                    access_token    TEXT,
+                    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    expires_at      TIMESTAMPTZ NOT NULL
                 );
 
-                -- Migration: add access_token if missing (for existing tables)
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                                   WHERE table_name='web_sessions' AND column_name='access_token') THEN
-                        ALTER TABLE web_sessions ADD COLUMN access_token TEXT;
-                    END IF;
-                END $$;
+                DO
+                $$
+                    BEGIN
+                        IF NOT EXISTS (SELECT 1
+                                       FROM information_schema.columns
+                                       WHERE table_name = 'web_sessions'
+                                         AND column_name = 'access_token') THEN
+                            ALTER TABLE web_sessions
+                                ADD COLUMN access_token TEXT;
+                        END IF;
+                    END
+                $$;
 
                 CREATE INDEX IF NOT EXISTS idx_web_sessions_discord_user_id
-                  ON web_sessions (discord_user_id);
+                    ON web_sessions (discord_user_id);
 
                 CREATE INDEX IF NOT EXISTS idx_web_sessions_expires_at
-                  ON web_sessions (expires_at);
+                    ON web_sessions (expires_at);
 
-                CREATE TABLE IF NOT EXISTS guild_settings (
-                  guild_id BIGINT PRIMARY KEY,
-                  settings JSONB NOT NULL DEFAULT '{}'
+                CREATE TABLE IF NOT EXISTS guild_settings
+                (
+                    guild_id BIGINT PRIMARY KEY,
+                    settings JSONB NOT NULL DEFAULT '{}'
                 );
 
-                CREATE TABLE IF NOT EXISTS dict (
-                  guild_id BIGINT PRIMARY KEY,
-                  dict JSONB NOT NULL DEFAULT '{}'
+                CREATE TABLE IF NOT EXISTS dict
+                (
+                    guild_id BIGINT PRIMARY KEY,
+                    dict     JSONB NOT NULL DEFAULT '{}'
                 );
 
-                CREATE TABLE IF NOT EXISTS users (
-                  discord_id TEXT PRIMARY KEY,
-                  stripe_customer_id TEXT UNIQUE,
-                  total_slots INTEGER NOT NULL DEFAULT 0
+                CREATE TABLE IF NOT EXISTS users
+                (
+                    discord_id         TEXT PRIMARY KEY,
+                    stripe_customer_id TEXT UNIQUE,
+                    total_slots        INTEGER NOT NULL DEFAULT 0
                 );
 
-                CREATE TABLE IF NOT EXISTS guild_boosts (
-                  id SERIAL PRIMARY KEY,
-                  guild_id BIGINT NOT NULL,
-                  user_id TEXT NOT NULL REFERENCES users(discord_id) ON DELETE CASCADE,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                CREATE TABLE IF NOT EXISTS guild_boosts
+                (
+                    id         SERIAL PRIMARY KEY,
+                    guild_id   BIGINT      NOT NULL,
+                    user_id    TEXT        NOT NULL REFERENCES users (discord_id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
 
-                -- Idempotency for Stripe
-                CREATE TABLE IF NOT EXISTS processed_stripe_events (
-                  event_id TEXT PRIMARY KEY,
-                  processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                CREATE TABLE IF NOT EXISTS processed_stripe_events
+                (
+                    event_id     TEXT PRIMARY KEY,
+                    processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
 
-                -- Migration: add created_at if missing
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                                   WHERE table_name='guild_boosts' AND column_name='created_at') THEN
-                        ALTER TABLE guild_boosts ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();
-                    END IF;
-                END $$;
+                DO
+                $$
+                    BEGIN
+                        IF NOT EXISTS (SELECT 1
+                                       FROM information_schema.columns
+                                       WHERE table_name = 'guild_boosts'
+                                         AND column_name = 'created_at') THEN
+                            ALTER TABLE guild_boosts
+                                ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+                        END IF;
+                    END
+                $$;
 
-                CREATE INDEX IF NOT EXISTS idx_guild_boosts_guild_id ON guild_boosts(guild_id);
-                CREATE INDEX IF NOT EXISTS idx_guild_boosts_user_id ON guild_boosts(user_id);
+                CREATE INDEX IF NOT EXISTS idx_guild_boosts_guild_id ON guild_boosts (guild_id);
+                CREATE INDEX IF NOT EXISTS idx_guild_boosts_user_id ON guild_boosts (user_id);
                 """
             )
+        logger.info("Database initialized successfully.")
 
 
 async def close_db() -> None:
-    """
-    Close asyncpg pool.
-    Call this from FastAPI shutdown event.
-    """
+    """Close asyncpg pool."""
     global _pool
     if _pool is not None:
         await _pool.close()
         _pool = None
+        logger.info("Database connection closed.")
 
 
-async def create_session(*, sid: str, discord_user_id: str, username: str | None, access_token: str | None, expires_at: datetime) -> None:
+async def create_session(
+        *,
+        sid: str,
+        discord_user_id: str,
+        username: str | None,
+        access_token: str | None,
+        expires_at: datetime
+) -> None:
     pool = _require_pool()
-    # トークンを暗号化
     encrypted_token = encrypt(access_token) if access_token else None
 
     async with pool.acquire() as conn:
@@ -159,7 +181,7 @@ async def create_session(*, sid: str, discord_user_id: str, username: str | None
 async def get_session_by_sid(sid: str) -> WebSession | None:
     """
     Returns session if exists and not expired.
-    If expired, deletes it and returns None.
+    If expired or decryption fails, deletes it and returns None.
     """
     pool = _require_pool()
 
@@ -181,11 +203,21 @@ async def get_session_by_sid(sid: str) -> WebSession | None:
         await delete_session(sid)
         return None
 
+    # Decrypt access token
+    decrypted_token = None
+    if row["access_token"]:
+        decrypted_token = decrypt(row["access_token"])
+        if decrypted_token is None:
+            # Decryption failed, invalidate session
+            logger.warning(f"Session {sid[:8]}... invalidated due to decryption failure.")
+            await delete_session(sid)
+            return None
+
     return WebSession(
         sid=row["sid"],
         discord_user_id=row["discord_user_id"],
         username=row["username"],
-        access_token=decrypt(row["access_token"]) if row["access_token"] else None,
+        access_token=decrypted_token,
         expires_at=expires_at,
     )
 
@@ -203,22 +235,19 @@ async def cleanup_expired_sessions(limit: int = 1000) -> int:
     """
     pool = _require_pool()
     async with pool.acquire() as conn:
-        # 1. Cleanup sessions
         status: str = await conn.execute(
             """
-            DELETE FROM web_sessions
-            WHERE sid IN (
-              SELECT sid
-              FROM web_sessions
-              WHERE expires_at <= now()
-              ORDER BY expires_at ASC
-              LIMIT $1
-            )
+            DELETE
+            FROM web_sessions
+            WHERE sid IN (SELECT sid
+                          FROM web_sessions
+                          WHERE expires_at <= now()
+                          ORDER BY expires_at ASC
+                          LIMIT $1)
             """,
             limit,
         )
-        
-        # 2. Cleanup old processed_stripe_events (older than 30 days)
+
         await conn.execute(
             "DELETE FROM processed_stripe_events WHERE processed_at < now() - interval '30 days'"
         )
@@ -230,9 +259,7 @@ async def cleanup_expired_sessions(limit: int = 1000) -> int:
 
 
 async def healthcheck() -> dict[str, Any]:
-    """
-    Simple DB healthcheck helper (optional).
-    """
+    """Simple DB healthcheck helper."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         value = await conn.fetchval("SELECT 1")
@@ -242,9 +269,10 @@ async def healthcheck() -> dict[str, Any]:
 async def get_guild_settings(guild_id: int) -> dict:
     pool = _require_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT settings FROM guild_settings WHERE guild_id = $1", guild_id)
+        row = await conn.fetchrow(
+            "SELECT settings FROM guild_settings WHERE guild_id = $1", guild_id
+        )
         if row:
-            import json
             raw_data = row["settings"]
             if isinstance(raw_data, str):
                 return json.loads(raw_data)
@@ -254,7 +282,6 @@ async def get_guild_settings(guild_id: int) -> dict:
 
 async def update_guild_settings(guild_id: int, settings: dict) -> None:
     pool = _require_pool()
-    import json
     settings_json = json.dumps(settings)
     async with pool.acquire() as conn:
         await conn.execute(
@@ -273,7 +300,6 @@ async def get_guild_dict(guild_id: int) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT dict FROM dict WHERE guild_id = $1", guild_id)
         if row:
-            import json
             raw_data = row["dict"]
             if isinstance(raw_data, str):
                 return json.loads(raw_data)
@@ -283,7 +309,6 @@ async def get_guild_dict(guild_id: int) -> dict:
 
 async def update_guild_dict(guild_id: int, dict_data: dict) -> None:
     pool = _require_pool()
-    import json
     dict_json = json.dumps(dict_data)
     async with pool.acquire() as conn:
         await conn.execute(
@@ -312,12 +337,12 @@ async def get_user_billing(discord_id: str) -> dict | None:
         )
         if not row:
             return None
-        
+
         boosts = await conn.fetch(
             "SELECT id, guild_id, user_id FROM guild_boosts WHERE user_id = $1",
             discord_id
         )
-        
+
         return {
             "discord_id": row["discord_id"],
             "stripe_customer_id": row["stripe_customer_id"],
@@ -378,14 +403,12 @@ async def sync_user_slots(stripe_customer_id: str, total_slots: int) -> None:
                 return
 
             discord_id = user["discord_id"]
-            
-            # Update slots
+
             await conn.execute(
                 "UPDATE users SET total_slots = $1 WHERE discord_id = $2",
                 total_slots, discord_id
             )
 
-            # If new total is less than current boosts, remove excess
             boosts = await conn.fetch(
                 "SELECT id FROM guild_boosts WHERE user_id = $1 ORDER BY created_at DESC",
                 discord_id
@@ -399,7 +422,6 @@ async def sync_user_slots(stripe_customer_id: str, total_slots: int) -> None:
 async def reset_user_slots_by_customer(stripe_customer_id: str) -> None:
     pool = _require_pool()
     async with pool.acquire() as conn:
-        # Get discord_id first to delete boosts
         discord_id = await conn.fetchval(
             "SELECT discord_id FROM users WHERE stripe_customer_id = $1",
             stripe_customer_id
@@ -431,13 +453,11 @@ async def handle_refund_by_customer(stripe_customer_id: str) -> dict | None:
             discord_id = user["discord_id"]
             new_total = max(0, user["total_slots"] - 1)
 
-            # Update slots
             await conn.execute(
                 "UPDATE users SET total_slots = $1 WHERE discord_id = $2",
                 new_total, discord_id
             )
 
-            # Check if we need to remove boosts
             boosts = await conn.fetch(
                 "SELECT id, guild_id FROM guild_boosts WHERE user_id = $1 ORDER BY created_at DESC",
                 discord_id
@@ -447,7 +467,7 @@ async def handle_refund_by_customer(stripe_customer_id: str) -> dict | None:
             if len(boosts) > new_total:
                 to_remove_count = len(boosts) - new_total
                 to_remove = boosts[:to_remove_count]
-                
+
                 for b in to_remove:
                     await conn.execute("DELETE FROM guild_boosts WHERE id = $1", b["id"])
                     removed_guilds.append(str(b["guild_id"]))
@@ -463,13 +483,19 @@ async def handle_refund_by_customer(stripe_customer_id: str) -> dict | None:
 async def is_event_processed(event_id: str) -> bool:
     pool = _require_pool()
     async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT EXISTS(SELECT 1 FROM processed_stripe_events WHERE event_id = $1)", event_id)
+        return await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM processed_stripe_events WHERE event_id = $1)",
+            event_id
+        )
 
 
 async def mark_event_processed(event_id: str) -> None:
     pool = _require_pool()
     async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO processed_stripe_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING", event_id)
+        await conn.execute(
+            "INSERT INTO processed_stripe_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            event_id
+        )
 
 
 async def delete_guild_boosts_by_guild(guild_id: int) -> int:
@@ -486,12 +512,10 @@ async def delete_guild_boosts_by_guild(guild_id: int) -> int:
 async def deactivate_guild_boost(guild_id: int, user_id: str) -> bool:
     """
     Remove a single boost from a guild for a specific user.
-    Uses CTID to delete only one row if multiple exist.
     """
     pool = _require_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Get one row's CTID
             row = await conn.fetchrow(
                 "SELECT ctid FROM guild_boosts WHERE guild_id = $1::BIGINT AND user_id = $2 LIMIT 1 FOR UPDATE",
                 guild_id,
@@ -499,8 +523,7 @@ async def deactivate_guild_boost(guild_id: int, user_id: str) -> bool:
             )
             if not row:
                 return False
-            
-            # Delete by CTID
+
             result = await conn.execute(
                 "DELETE FROM guild_boosts WHERE ctid = $1",
                 row["ctid"]
@@ -511,39 +534,34 @@ async def deactivate_guild_boost(guild_id: int, user_id: str) -> bool:
 async def activate_guild_boost(guild_id: int, user_id: str, max_boosts: int = 3) -> bool:
     """
     Activate a boost for a guild using a user's slot.
-    Checks for slot availability and existing boosts count.
     """
     pool = _require_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # 1. Lock user and check slots
             user = await conn.fetchrow(
                 "SELECT total_slots FROM users WHERE discord_id = $1 FOR UPDATE",
                 user_id
             )
             if not user:
-                return False  # User not found or no slots
-            
+                return False
+
             total_slots = user["total_slots"]
-            
-            # 2. Count used slots by this user
+
             used_slots = await conn.fetchval(
                 "SELECT COUNT(*) FROM guild_boosts WHERE user_id = $1",
                 user_id
             )
-            
+
             if used_slots >= total_slots:
-                return False  # No available slots
-            
-            # 3. Check guild boost count (limit check)
+                return False
+
             current_guild_boosts = await conn.fetchval(
                 "SELECT COUNT(*) FROM guild_boosts WHERE guild_id = $1::BIGINT",
                 guild_id
             )
             if current_guild_boosts >= max_boosts:
                 return False
-                
-            # 4. Insert boost
+
             await conn.execute(
                 "INSERT INTO guild_boosts (guild_id, user_id) VALUES ($1::BIGINT, $2)",
                 guild_id,
@@ -553,9 +571,6 @@ async def activate_guild_boost(guild_id: int, user_id: str, max_boosts: int = 3)
 
 
 async def get_guild_boost_count(guild_id: int) -> int:
-    """
-    Get the number of boosts for a guild.
-    """
     pool = _require_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
@@ -565,9 +580,6 @@ async def get_guild_boost_count(guild_id: int) -> int:
 
 
 async def is_guild_boosted(guild_id: int) -> bool:
-    """
-    Check if a guild is boosted.
-    """
     pool = _require_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
@@ -579,9 +591,6 @@ async def is_guild_boosted(guild_id: int) -> bool:
 # --- Bot Instances ---
 
 async def get_bot_instances() -> list[dict]:
-    """
-    Fetch all active bot instances from the database.
-    """
     pool = _require_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -591,9 +600,6 @@ async def get_bot_instances() -> list[dict]:
 
 
 async def add_bot_instance(client_id: str, bot_name: str, is_active: bool = True) -> int:
-    """
-    Add a new bot instance to the database.
-    """
     pool = _require_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
