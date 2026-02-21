@@ -4,8 +4,10 @@ venv/
 env/
 
 # IDE
-.idea
-.idea/*
+.idea/
+.vscode/
+*.swp
+*.swo
 
 # Python
 __pycache__/
@@ -18,6 +20,22 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+*.egg
 
-# Env
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment
 .env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
