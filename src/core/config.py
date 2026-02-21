@@ -40,11 +40,22 @@ GUILDS_CACHE_TTL = 30  # seconds
 BOT_GUILDS_CACHE_TTL = 60  # seconds
 BOT_INSTANCES_CACHE_TTL = 300  # 5 minutes
 
+# Guild settings limits
+FREE_MAX_CHARS = 50
+PREMIUM_MAX_CHARS = 200
+FREE_DICT_LIMIT = 10
+PREMIUM_DICT_LIMIT = 100
+DEFAULT_MAX_BOOSTS_PER_GUILD = 3
+
+# Input validation limits
+MAX_DICT_WORD_LENGTH = 100
+MAX_DICT_READING_LENGTH = 200
+
 # Default guild settings
 DEFAULT_SETTINGS = {
     "auto_join": False,
     "auto_join_config": {},
-    "max_chars": 50,
+    "max_chars": FREE_MAX_CHARS,
     "read_vc_status": False,
     "read_mention": True,
     "read_emoji": True,
