@@ -156,8 +156,5 @@ async def get_bot_instances_api():
 @app.get("/api/me")
 async def api_me_redirect():
     """Redirect to auth/me for backwards compatibility."""
-    from fastapi import Request
-    from src.core.dependencies import get_current_session
-    # This is handled by auth router, but keeping for explicit backwards compat
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/auth/me", status_code=307)
+    return RedirectResponse(url="/auth/me", status_code=303)
