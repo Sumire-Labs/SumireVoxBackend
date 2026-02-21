@@ -3,16 +3,15 @@
 import os
 import logging
 from cryptography.fernet import Fernet, InvalidToken
-from dotenv import load_dotenv
 
-load_dotenv()
+from src.core.config import IS_PRODUCTION
 
 logger = logging.getLogger(__name__)
 
 _key = os.environ.get("ENCRYPTION_KEY")
 
 if not _key:
-    if os.environ.get("ENV", "development").lower() == "production":
+    if IS_PRODUCTION:
         raise RuntimeError(
             "ENCRYPTION_KEY environment variable is required in production. "
             "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
@@ -34,7 +33,7 @@ def encrypt(text: str) -> str:
     return _fernet.encrypt(text.encode()).decode()
 
 
-def decrypt(token: str) -> str:
+def decrypt(token: str) -> str | None:
     """
     Decrypt a Fernet-encrypted string.
     Returns None and logs error if decryption fails.
