@@ -36,10 +36,7 @@ def _require_pool() -> asyncpg.Pool:
 
 
 async def init_db(database_url: str) -> None:
-    """
-    Initialize asyncpg pool and ensure required tables exist.
-    Safe to call multiple times.
-    """
+    """Initialize asyncpg pool and ensure required tables exist."""
     global _pool
 
     if _pool is not None:
@@ -153,6 +150,8 @@ async def close_db() -> None:
         logger.info("Database connection closed.")
 
 
+# --- Session Management ---
+
 async def create_session(
         *,
         sid: str,
@@ -179,10 +178,7 @@ async def create_session(
 
 
 async def get_session_by_sid(sid: str) -> WebSession | None:
-    """
-    Returns session if exists and not expired.
-    If expired or decryption fails, deletes it and returns None.
-    """
+    """Returns session if exists and not expired."""
     pool = _require_pool()
 
     async with pool.acquire() as conn:
@@ -203,12 +199,10 @@ async def get_session_by_sid(sid: str) -> WebSession | None:
         await delete_session(sid)
         return None
 
-    # Decrypt access token
     decrypted_token = None
     if row["access_token"]:
         decrypted_token = decrypt(row["access_token"])
         if decrypted_token is None:
-            # Decryption failed, invalidate session
             logger.warning(f"Session {sid[:8]}... invalidated due to decryption failure.")
             await delete_session(sid)
             return None
@@ -229,10 +223,7 @@ async def delete_session(sid: str) -> None:
 
 
 async def cleanup_expired_sessions(limit: int = 1000) -> int:
-    """
-    Delete expired sessions and old processed stripe events.
-    Returns deleted session count.
-    """
+    """Delete expired sessions and old processed stripe events."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         status: str = await conn.execute(
@@ -258,13 +249,7 @@ async def cleanup_expired_sessions(limit: int = 1000) -> int:
         return 0
 
 
-async def healthcheck() -> dict[str, Any]:
-    """Simple DB healthcheck helper."""
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        value = await conn.fetchval("SELECT 1")
-    return {"ok": value == 1}
-
+# --- Guild Settings ---
 
 async def get_guild_settings(guild_id: int) -> dict:
     pool = _require_pool()
@@ -295,6 +280,8 @@ async def update_guild_settings(guild_id: int, settings: dict) -> None:
         )
 
 
+# --- Guild Dictionary ---
+
 async def get_guild_dict(guild_id: int) -> dict:
     pool = _require_pool()
     async with pool.acquire() as conn:
@@ -322,7 +309,7 @@ async def update_guild_dict(guild_id: int, dict_data: dict) -> None:
         )
 
 
-# --- Billing (Stripe) ---
+# --- User Billing ---
 
 async def get_user_billing(discord_id: str) -> dict | None:
     pool = _require_pool()
@@ -390,35 +377,6 @@ async def add_user_slots(stripe_customer_id: str, count: int) -> None:
             )
 
 
-async def sync_user_slots(stripe_customer_id: str, total_slots: int) -> None:
-    """Force sync slots to a specific value (used by sync script)"""
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            user = await conn.fetchrow(
-                "SELECT discord_id, total_slots FROM users WHERE stripe_customer_id = $1 FOR UPDATE",
-                stripe_customer_id
-            )
-            if not user:
-                return
-
-            discord_id = user["discord_id"]
-
-            await conn.execute(
-                "UPDATE users SET total_slots = $1 WHERE discord_id = $2",
-                total_slots, discord_id
-            )
-
-            boosts = await conn.fetch(
-                "SELECT id FROM guild_boosts WHERE user_id = $1 ORDER BY created_at DESC",
-                discord_id
-            )
-            if len(boosts) > total_slots:
-                to_remove = boosts[:len(boosts) - total_slots]
-                for b in to_remove:
-                    await conn.execute("DELETE FROM guild_boosts WHERE id = $1", b["id"])
-
-
 async def reset_user_slots_by_customer(stripe_customer_id: str) -> None:
     pool = _require_pool()
     async with pool.acquire() as conn:
@@ -436,10 +394,7 @@ async def reset_user_slots_by_customer(stripe_customer_id: str) -> None:
 
 
 async def handle_refund_by_customer(stripe_customer_id: str) -> dict | None:
-    """
-    Handle a refund: decrement total_slots and remove boosts if they exceed the new total.
-    Returns info about the changes for logging.
-    """
+    """Handle a refund: decrement total_slots and remove boosts if needed."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -480,61 +435,28 @@ async def handle_refund_by_customer(stripe_customer_id: str) -> dict | None:
             }
 
 
-async def is_event_processed(event_id: str) -> bool:
+# --- Guild Boosts ---
+
+async def get_guild_boost_count(guild_id: int) -> int:
     pool = _require_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM processed_stripe_events WHERE event_id = $1)",
-            event_id
+            "SELECT COUNT(*) FROM guild_boosts WHERE guild_id = $1::BIGINT",
+            guild_id
         )
 
 
-async def mark_event_processed(event_id: str) -> None:
+async def is_guild_boosted(guild_id: int) -> bool:
     pool = _require_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO processed_stripe_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            event_id
+        return await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM guild_boosts WHERE guild_id = $1::BIGINT)",
+            guild_id
         )
-
-
-async def delete_guild_boosts_by_guild(guild_id: int) -> int:
-    """Remove all boosts from a guild (e.g. when bot is kicked)"""
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        status = await conn.execute("DELETE FROM guild_boosts WHERE guild_id = $1", guild_id)
-        try:
-            return int(status.split()[-1])
-        except Exception:
-            return 0
-
-
-async def deactivate_guild_boost(guild_id: int, user_id: str) -> bool:
-    """
-    Remove a single boost from a guild for a specific user.
-    """
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT ctid FROM guild_boosts WHERE guild_id = $1::BIGINT AND user_id = $2 LIMIT 1 FOR UPDATE",
-                guild_id,
-                user_id
-            )
-            if not row:
-                return False
-
-            result = await conn.execute(
-                "DELETE FROM guild_boosts WHERE ctid = $1",
-                row["ctid"]
-            )
-            return result == "DELETE 1"
 
 
 async def activate_guild_boost(guild_id: int, user_id: str, max_boosts: int = 3) -> bool:
-    """
-    Activate a boost for a guild using a user's slot.
-    """
+    """Activate a boost for a guild using a user's slot."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -570,27 +492,50 @@ async def activate_guild_boost(guild_id: int, user_id: str, max_boosts: int = 3)
             return True
 
 
-async def get_guild_boost_count(guild_id: int) -> int:
+async def deactivate_guild_boost(guild_id: int, user_id: str) -> bool:
+    """Remove a single boost from a guild for a specific user."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT ctid FROM guild_boosts WHERE guild_id = $1::BIGINT AND user_id = $2 LIMIT 1 FOR UPDATE",
+                guild_id,
+                user_id
+            )
+            if not row:
+                return False
+
+            result = await conn.execute(
+                "DELETE FROM guild_boosts WHERE ctid = $1",
+                row["ctid"]
+            )
+            return result == "DELETE 1"
+
+
+# --- Stripe Events ---
+
+async def is_event_processed(event_id: str) -> bool:
     pool = _require_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT COUNT(*) FROM guild_boosts WHERE guild_id = $1::BIGINT",
-            guild_id
+            "SELECT EXISTS(SELECT 1 FROM processed_stripe_events WHERE event_id = $1)",
+            event_id
         )
 
 
-async def is_guild_boosted(guild_id: int) -> bool:
+async def mark_event_processed(event_id: str) -> None:
     pool = _require_pool()
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM guild_boosts WHERE guild_id = $1::BIGINT)",
-            guild_id
+        await conn.execute(
+            "INSERT INTO processed_stripe_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            event_id
         )
 
 
 # --- Bot Instances ---
 
 async def get_bot_instances() -> list[dict]:
+    """Fetch all active bot instances from the database."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -599,12 +544,11 @@ async def get_bot_instances() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-async def add_bot_instance(client_id: str, bot_name: str, is_active: bool = True) -> int:
+# --- Health Check ---
+
+async def healthcheck() -> dict[str, Any]:
+    """Simple DB healthcheck helper."""
     pool = _require_pool()
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "INSERT INTO bot_instances (client_id, bot_name, is_active) VALUES ($1, $2, $3) RETURNING id",
-            client_id,
-            bot_name,
-            is_active
-        )
+        value = await conn.fetchval("SELECT 1")
+    return {"ok": value == 1}
