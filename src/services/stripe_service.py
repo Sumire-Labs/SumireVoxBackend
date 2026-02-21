@@ -1,5 +1,6 @@
 # src/services/stripe_service.py
 
+import asyncio
 import logging
 import stripe
 
@@ -22,34 +23,38 @@ stripe.api_key = STRIPE_API_KEY
 async def create_checkout_session(discord_user_id: str, customer_id: str | None) -> str:
     """
     Create a Stripe checkout session and return the URL.
+    Uses asyncio.to_thread to avoid blocking the event loop.
     """
-    checkout_session = stripe.checkout.Session.create(
-        customer=customer_id,
-        line_items=[
-            {
-                "price": STRIPE_PRICE_ID,
-                "quantity": 1,
-            },
-        ],
-        mode="subscription",
-        success_url=f"{DOMAIN}/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{DOMAIN}/dashboard",
-        metadata={
-            "discord_id": discord_user_id
-        },
-        subscription_data={
-            "metadata": {
+    def _create_session():
+        return stripe.checkout.Session.create(
+            customer=customer_id,
+            line_items=[
+                {
+                    "price": STRIPE_PRICE_ID,
+                    "quantity": 1,
+                },
+            ],
+            mode="subscription",
+            success_url=f"{DOMAIN}/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{DOMAIN}/dashboard",
+            metadata={
                 "discord_id": discord_user_id
+            },
+            subscription_data={
+                "metadata": {
+                    "discord_id": discord_user_id
+                }
             }
-        }
-    )
+        )
+
+    checkout_session = await asyncio.to_thread(_create_session)
     return checkout_session.url
 
 
 def verify_webhook_signature(payload: bytes, sig_header: str) -> dict:
     """
     Verify Stripe webhook signature and return the event.
-    Raises ValueError or stripe.error.SignatureVerificationError on failure.
+    Raises ValueError or stripe.SignatureVerificationError on failure.
     """
     return stripe.Webhook.construct_event(
         payload, sig_header, STRIPE_WEBHOOK_SECRET
