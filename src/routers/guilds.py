@@ -2,8 +2,18 @@
 
 import logging
 from fastapi import APIRouter, Request, HTTPException
+from pydantic import ValidationError
 
-from src.core.config import DEFAULT_SETTINGS, MANAGE_GUILD, ADMINISTRATOR
+from src.core.config import (
+    DEFAULT_SETTINGS,
+    MANAGE_GUILD,
+    ADMINISTRATOR,
+    FREE_MAX_CHARS,
+    PREMIUM_MAX_CHARS,
+    FREE_DICT_LIMIT,
+    PREMIUM_DICT_LIMIT,
+)
+from src.core.models import GuildSettingsUpdate, DictEntry
 from src.core.database import (
     get_guild_settings,
     update_guild_settings,
@@ -16,7 +26,7 @@ from src.core.dependencies import (
     get_current_session,
     require_manage_guild_permission,
 )
-from src.services.discord import fetch_user_guilds, is_bot_in_guild
+from src.services.discord import fetch_user_guilds, fetch_bot_guilds_as_set
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +40,7 @@ async def get_guilds(request: Request):
     client = get_http_client(request)
 
     user_guilds = await fetch_user_guilds(client, sess.access_token)
+    bot_guild_set = await fetch_bot_guilds_as_set(client)
 
     manageable_guilds = []
     for g in user_guilds:
@@ -38,11 +49,11 @@ async def get_guilds(request: Request):
                         (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
 
         if is_manageable:
-            guild_id = int(g["id"])
-            bot_in_guild = await is_bot_in_guild(client, guild_id)
+            guild_id = g["id"]
+            bot_in_guild = guild_id in bot_guild_set
 
             manageable_guilds.append({
-                "id": g["id"],
+                "id": guild_id,
                 "name": g["name"],
                 "icon": g["icon"],
                 "permissions": g["permissions"],
@@ -61,7 +72,8 @@ async def get_settings(guild_id: int, request: Request):
     settings = await get_guild_settings(guild_id)
     if not settings:
         client = get_http_client(request)
-        if await is_bot_in_guild(client, guild_id):
+        bot_guild_set = await fetch_bot_guilds_as_set(client)
+        if str(guild_id) in bot_guild_set:
             return DEFAULT_SETTINGS
         else:
             return {}
@@ -74,17 +86,32 @@ async def update_settings_endpoint(guild_id: int, request: Request):
     sess = await get_current_session(request)
     await require_manage_guild_permission(request, sess, guild_id)
 
-    new_settings = await request.json()
+    try:
+        raw_data = await request.json()
+        settings_update = GuildSettingsUpdate(**raw_data)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Get current settings and merge with updates
+    current_settings = await get_guild_settings(guild_id)
+    if not current_settings:
+        current_settings = DEFAULT_SETTINGS.copy()
+
+    new_settings = {**current_settings, **settings_update.to_update_dict()}
 
     # Premium check
     boost_count = await get_guild_boost_count(guild_id)
     if boost_count < 1:
-        if new_settings.get("max_chars", 0) > 50:
-            new_settings["max_chars"] = 50
+        # Free tier limits
+        if new_settings.get("max_chars", 0) > FREE_MAX_CHARS:
+            new_settings["max_chars"] = FREE_MAX_CHARS
         new_settings["auto_join"] = False
     else:
-        if new_settings.get("max_chars", 0) > 200:
-            new_settings["max_chars"] = 200
+        # Premium tier limits
+        if new_settings.get("max_chars", 0) > PREMIUM_MAX_CHARS:
+            new_settings["max_chars"] = PREMIUM_MAX_CHARS
 
     await update_guild_settings(guild_id, new_settings)
     return {"ok": True}
@@ -106,26 +133,27 @@ async def add_dict(guild_id: int, request: Request):
     sess = await get_current_session(request)
     await require_manage_guild_permission(request, sess, guild_id)
 
-    payload = await request.json()
-    word = payload.get("word")
-    reading = payload.get("reading")
-
-    if not word or not reading:
-        raise HTTPException(status_code=400, detail="word and reading are required")
+    try:
+        raw_data = await request.json()
+        entry = DictEntry(**raw_data)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     d = await get_guild_dict(guild_id)
 
     # Premium check
     boost_count = await get_guild_boost_count(guild_id)
-    limit = 100 if boost_count >= 1 else 10
+    limit = PREMIUM_DICT_LIMIT if boost_count >= 1 else FREE_DICT_LIMIT
 
-    if len(d) >= limit and word not in d:
+    if len(d) >= limit and entry.word not in d:
         raise HTTPException(
             status_code=403,
             detail=f"Dictionary limit reached ({limit}). Upgrade to premium for more slots."
         )
 
-    d[word] = reading
+    d[entry.word] = entry.reading
     await update_guild_dict(guild_id, d)
     return {"ok": True}
 
