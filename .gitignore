@@ -28,7 +28,9 @@ dist/
 htmlcov/
 
 # Environment
-.env
+.env*
+*.env
+backup.env
 .env.local
 .env.*.local
 
