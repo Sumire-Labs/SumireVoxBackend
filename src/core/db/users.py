@@ -138,3 +138,18 @@ async def handle_refund_by_customer(stripe_customer_id: str) -> dict | None:
                 "new_total": new_total,
                 "removed_guilds": removed_guilds,
             }
+
+
+async def sync_user_slots(stripe_customer_id: str, slots: int) -> None:
+    """Stripeと同期してユーザーのスロット数を設定する"""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET total_slots = $1
+            WHERE stripe_customer_id = $2
+            """,
+            slots,
+            stripe_customer_id,
+        )

@@ -22,6 +22,7 @@ from src.core.db.users import (
     add_user_slots,
     reset_user_slots_by_customer,
     handle_refund_by_customer,
+    sync_user_slots,
 )
 from src.core.db.guild_boosts import (
     get_guild_boost_count,
@@ -70,6 +71,7 @@ __all__ = [
     # stripe_events
     "is_event_processed",
     "mark_event_processed",
+    "sync_user_slots",
     # bot_instances
     "get_bot_instances",
 ]
