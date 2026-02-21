@@ -70,6 +70,7 @@ async def init_db(database_url: str) -> None:
                 );
 
                 DO
+
                 $$
                     BEGIN
                         IF NOT EXISTS (SELECT 1
@@ -80,6 +81,7 @@ async def init_db(database_url: str) -> None:
                                 ADD COLUMN access_token TEXT;
                         END IF;
                     END
+
                 $$;
 
                 CREATE INDEX IF NOT EXISTS idx_web_sessions_discord_user_id
@@ -122,6 +124,7 @@ async def init_db(database_url: str) -> None:
                 );
 
                 DO
+
                 $$
                     BEGIN
                         IF NOT EXISTS (SELECT 1
@@ -132,6 +135,7 @@ async def init_db(database_url: str) -> None:
                                 ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();
                         END IF;
                     END
+
                 $$;
 
                 CREATE INDEX IF NOT EXISTS idx_guild_boosts_guild_id ON guild_boosts (guild_id);
@@ -196,7 +200,8 @@ async def get_session_by_sid(sid: str) -> WebSession | None:
 
     expires_at: datetime = row["expires_at"]
     if expires_at <= datetime.now(timezone.utc):
-        await delete_session(sid)
+        # Fire-and-forget: 期限切れセッションの削除をバックグラウンドで実行
+        asyncio.create_task(_delete_session_background(sid))
         return None
 
     decrypted_token = None
@@ -204,7 +209,7 @@ async def get_session_by_sid(sid: str) -> WebSession | None:
         decrypted_token = decrypt(row["access_token"])
         if decrypted_token is None:
             logger.warning(f"Session {sid[:8]}... invalidated due to decryption failure.")
-            await delete_session(sid)
+            asyncio.create_task(_delete_session_background(sid))
             return None
 
     return WebSession(
@@ -214,6 +219,14 @@ async def get_session_by_sid(sid: str) -> WebSession | None:
         access_token=decrypted_token,
         expires_at=expires_at,
     )
+
+
+async def _delete_session_background(sid: str) -> None:
+    """Background task to delete session."""
+    try:
+        await delete_session(sid)
+    except Exception as e:
+        logger.error(f"Failed to delete session {sid[:8]}...: {e}")
 
 
 async def delete_session(sid: str) -> None:
@@ -446,6 +459,29 @@ async def get_guild_boost_count(guild_id: int) -> int:
         )
 
 
+async def get_guild_boost_counts_batch(guild_ids: list[int]) -> dict[int, int]:
+    """Batch fetch boost counts for multiple guilds."""
+    if not guild_ids:
+        return {}
+
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT guild_id, COUNT(*) as count
+            FROM guild_boosts
+            WHERE guild_id = ANY($1::BIGINT[])
+            GROUP BY guild_id
+            """,
+            guild_ids
+        )
+
+    result = {guild_id: 0 for guild_id in guild_ids}
+    for row in rows:
+        result[row["guild_id"]] = row["count"]
+    return result
+
+
 async def is_guild_boosted(guild_id: int) -> bool:
     pool = _require_pool()
     async with pool.acquire() as conn:
@@ -455,11 +491,12 @@ async def is_guild_boosted(guild_id: int) -> bool:
         )
 
 
-async def activate_guild_boost(guild_id: int, user_id: str, max_boosts: int = 3) -> bool:
+async def activate_guild_boost(guild_id: int, user_id: str, max_boosts: int) -> bool:
     """Activate a boost for a guild using a user's slot."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Lock both user and guild boost rows to prevent race conditions
             user = await conn.fetchrow(
                 "SELECT total_slots FROM users WHERE discord_id = $1 FOR UPDATE",
                 user_id
@@ -476,6 +513,12 @@ async def activate_guild_boost(guild_id: int, user_id: str, max_boosts: int = 3)
 
             if used_slots >= total_slots:
                 return False
+
+            # Use advisory lock for guild to prevent race condition
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                guild_id
+            )
 
             current_guild_boosts = await conn.fetchval(
                 "SELECT COUNT(*) FROM guild_boosts WHERE guild_id = $1::BIGINT",
