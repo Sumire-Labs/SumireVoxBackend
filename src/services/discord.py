@@ -1,5 +1,6 @@
 # src/services/discord.py
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import List
@@ -18,7 +19,13 @@ from src.core.database import get_bot_instances
 
 logger = logging.getLogger(__name__)
 
-# Caches
+
+def _hash_token(token: str) -> str:
+    """Hash a token for use as cache key."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+# Caches - using hashed tokens as keys for security
 GUILDS_CACHE: TTLCache = TTLCache(maxsize=200, ttl=GUILDS_CACHE_TTL)
 
 # Bot guilds cache
@@ -32,8 +39,10 @@ _bot_instances_cache_ts: datetime | None = None
 
 async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> list:
     """Fetch guilds from Discord or cache."""
-    if access_token in GUILDS_CACHE:
-        return GUILDS_CACHE[access_token]
+    cache_key = _hash_token(access_token)
+
+    if cache_key in GUILDS_CACHE:
+        return GUILDS_CACHE[cache_key]
 
     res = await client.get(
         "https://discord.com/api/users/@me/guilds",
@@ -56,7 +65,7 @@ async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> lis
         }
         for g in guilds
     ]
-    GUILDS_CACHE[access_token] = minimal_guilds
+    GUILDS_CACHE[cache_key] = minimal_guilds
     return minimal_guilds
 
 
@@ -85,6 +94,12 @@ async def fetch_bot_guilds(client: httpx.AsyncClient) -> List[str]:
     _bot_guilds_cache = [g["id"] for g in guilds]
     _bot_guilds_cache_ts = now
     return _bot_guilds_cache
+
+
+async def fetch_bot_guilds_as_set(client: httpx.AsyncClient) -> set[str]:
+    """Fetch guilds where the bot is present as a set for efficient lookup."""
+    guild_ids = await fetch_bot_guilds(client)
+    return set(guild_ids)
 
 
 async def is_bot_in_guild(client: httpx.AsyncClient, guild_id: int) -> bool:
