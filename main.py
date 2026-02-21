@@ -5,13 +5,13 @@ import secrets
 import hmac
 import hashlib
 import logging
-import json
 import asyncio
 import gc
 import psutil
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from typing import List
 
 import stripe
 from dotenv import load_dotenv
@@ -33,10 +33,13 @@ logger = logging.getLogger("sumire-vox-backend")
 
 load_dotenv()
 
-DISCORD_CLIENT_ID_0 = os.environ.get("DISCORD_CLIENT_ID_0") or os.environ.get("DISCORD_CLIENT_ID")
-DISCORD_CLIENT_ID_1 = os.environ.get("DISCORD_CLIENT_ID_1")
-DISCORD_CLIENT_ID_2 = os.environ.get("DISCORD_CLIENT_ID_2")
-DISCORD_CLIENT_ID = DISCORD_CLIENT_ID_0  # Default to 0 for OAuth
+# Environment
+ENV = os.environ.get("ENV", "development").lower()
+IS_PRODUCTION = ENV == "production"
+
+# Discord OAuth - OAuthにはメインBotのクライアントIDを使用
+# bot_instancesテーブルから取得するため、起動時に設定
+DISCORD_CLIENT_ID: str | None = None  # 起動時にDBから設定
 DISCORD_CLIENT_SECRET = os.environ["DISCORD_CLIENT_SECRET"]
 DISCORD_REDIRECT_URI = os.environ["DISCORD_REDIRECT_URI"]
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -44,6 +47,7 @@ SESSION_SECRET = os.environ["SESSION_SECRET"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
 
+# Stripe
 STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
@@ -59,13 +63,17 @@ ADMINISTRATOR = 0x8
 MANAGE_GUILD = 0x20
 
 # Caching for Discord API
-# token -> guilds_list
-GUILDS_CACHE = TTLCache(maxsize=200, ttl=30)
+GUILDS_CACHE: TTLCache = TTLCache(maxsize=200, ttl=30)
 
 # Bot guilds cache (to check bot presence)
-BOT_GUILDS_CACHE = None
-BOT_GUILDS_CACHE_TS = None
+BOT_GUILDS_CACHE: List[str] | None = None
+BOT_GUILDS_CACHE_TS: datetime | None = None
 BOT_GUILDS_CACHE_TTL = 60  # seconds
+
+# Bot instances cache (from database)
+BOT_INSTANCES_CACHE: List[dict] | None = None
+BOT_INSTANCES_CACHE_TS: datetime | None = None
+BOT_INSTANCES_CACHE_TTL = 300  # 5分
 
 DEFAULT_SETTINGS = {
     "auto_join": False,
@@ -82,6 +90,53 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _get_allowed_origins() -> list[str]:
+    """Get CORS allowed origins based on environment."""
+    origins = [DOMAIN]
+    if not IS_PRODUCTION:
+        origins.extend([
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ])
+    return origins
+
+
+async def get_bot_instances_cached() -> List[dict]:
+    """
+    Get bot instances from database with caching.
+    """
+    global BOT_INSTANCES_CACHE, BOT_INSTANCES_CACHE_TS
+
+    now = datetime.now(timezone.utc)
+    if BOT_INSTANCES_CACHE is not None and BOT_INSTANCES_CACHE_TS:
+        if (now - BOT_INSTANCES_CACHE_TS).total_seconds() < BOT_INSTANCES_CACHE_TTL:
+            return BOT_INSTANCES_CACHE
+
+    instances = await db.get_bot_instances()
+    BOT_INSTANCES_CACHE = instances
+    BOT_INSTANCES_CACHE_TS = now
+
+    return instances
+
+
+async def get_primary_bot_client_id() -> str | None:
+    """
+    Get the primary bot's client_id (first active instance).
+    """
+    instances = await get_bot_instances_cached()
+    if instances:
+        return instances[0]["client_id"]
+    return None
+
+
+async def get_max_boosts_per_guild() -> int:
+    """
+    Get maximum boosts per guild based on number of active bot instances.
+    """
+    instances = await get_bot_instances_cached()
+    return len(instances) if instances else 1
+
+
 async def background_cleanup():
     """定期的に実行するクリーンアップタスク"""
     while True:
@@ -91,18 +146,26 @@ async def background_cleanup():
 
             # 1. BOT_GUILDS_CACHE の期限切れチェックとクリア
             global BOT_GUILDS_CACHE, BOT_GUILDS_CACHE_TS
-            now = datetime.now()
+            global BOT_INSTANCES_CACHE, BOT_INSTANCES_CACHE_TS
+
+            now = datetime.now(timezone.utc)
             if BOT_GUILDS_CACHE_TS and (now - BOT_GUILDS_CACHE_TS).total_seconds() >= BOT_GUILDS_CACHE_TTL:
                 logger.info("BOT_GUILDS_CACHE をクリアしました。")
                 BOT_GUILDS_CACHE = None
                 BOT_GUILDS_CACHE_TS = None
 
-            # 2. 期限切れセッションと古い Stripe イベントの削除
+            # 2. BOT_INSTANCES_CACHE の期限切れチェックとクリア
+            if BOT_INSTANCES_CACHE_TS and (now - BOT_INSTANCES_CACHE_TS).total_seconds() >= BOT_INSTANCES_CACHE_TTL:
+                logger.info("BOT_INSTANCES_CACHE をクリアしました。")
+                BOT_INSTANCES_CACHE = None
+                BOT_INSTANCES_CACHE_TS = None
+
+            # 3. 期限切れセッションと古い Stripe イベントの削除
             deleted_sessions = await db.cleanup_expired_sessions()
             if deleted_sessions > 0:
                 logger.info(f"期限切れのセッションを {deleted_sessions} 件削除しました。")
 
-            # 3. ガベージコレクションの強制実行
+            # 4. ガベージコレクションの強制実行
             gc.collect()
             logger.info("定期クリーンアップが完了しました。")
         except asyncio.CancelledError:
@@ -114,19 +177,22 @@ async def background_cleanup():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global DISCORD_CLIENT_ID
+
     await db.init_db(DATABASE_URL)
-    
-    # Initialize bot instances if empty (first run migration/setup)
+
+    # bot_instancesテーブルからメインBotのクライアントIDを取得
     instances = await db.get_bot_instances()
-    if not instances and DISCORD_CLIENT_ID_0:
-        logger.info("Initializing bot_instances table with environment values...")
-        # 1台目
-        await db.add_bot_instance(DISCORD_CLIENT_ID_0, "SumireVox #1")
-        # 2台目以降があれば追加
-        if DISCORD_CLIENT_ID_1:
-            await db.add_bot_instance(DISCORD_CLIENT_ID_1, "SumireVox #2")
-        if DISCORD_CLIENT_ID_2:
-            await db.add_bot_instance(DISCORD_CLIENT_ID_2, "SumireVox #3")
+    if not instances:
+        logger.error("bot_instancesテーブルにアクティブなBotが登録されていません。")
+        raise RuntimeError(
+            "No active bot instances found in database. "
+            "Please add at least one bot instance to the bot_instances table."
+        )
+
+    DISCORD_CLIENT_ID = instances[0]["client_id"]
+    logger.info(f"Primary bot client_id loaded: {DISCORD_CLIENT_ID}")
+    logger.info(f"Total active bot instances: {len(instances)}")
 
     # バックグラウンドタスクの起動
     cleanup_task = asyncio.create_task(background_cleanup())
@@ -136,6 +202,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
         await app.state.http_client.aclose()
         await db.close_db()
 
@@ -144,7 +214,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[DOMAIN, "http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -159,19 +229,29 @@ def _sign(value: str) -> str:
 def _verify_signed(signed: str | None) -> str | None:
     if not signed or "." not in signed:
         return None
-    value, sig = signed.split(".", 1)
+    value, sig = signed.rsplit(".", 1)
     expected = hmac.new(SESSION_SECRET.encode(), value.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(sig, expected):
         return None
     return value
 
 
+def _get_http_client(request: Request) -> httpx.AsyncClient:
+    """Get the shared HTTP client from app state."""
+    return request.app.state.http_client
+
+
 @app.get("/auth/discord/start")
 async def discord_start():
     state = secrets.token_urlsafe(32)
 
+    # メインBotのクライアントIDを使用
+    client_id = await get_primary_bot_client_id()
+    if not client_id:
+        raise HTTPException(status_code=500, detail="No bot instance configured")
+
     params = {
-        "client_id": DISCORD_CLIENT_ID,
+        "client_id": client_id,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
         "scope": "identify guilds",
@@ -181,7 +261,6 @@ async def discord_start():
     authorize_url = f"https://discord.com/oauth2/authorize?{urlencode(params)}"
     res = RedirectResponse(authorize_url, status_code=302)
 
-    # state を HttpOnly Cookie で保持（CSRF対策）
     res.set_cookie(
         key="discord_oauth_state",
         value=_sign(state),
@@ -209,21 +288,27 @@ async def discord_callback(request: Request):
     if not state_cookie or state_cookie != state:
         raise HTTPException(status_code=400, detail="Invalid state")
 
+    client = _get_http_client(request)
+
+    # メインBotのクライアントIDを使用
+    client_id = await get_primary_bot_client_id()
+    if not client_id:
+        raise HTTPException(status_code=500, detail="No bot instance configured")
+
     # code -> token
-    async with httpx.AsyncClient(timeout=20) as client:
-        token_res = await client.post(
-            "https://discord.com/api/oauth2/token",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "client_id": DISCORD_CLIENT_ID,
-                "client_secret": DISCORD_CLIENT_SECRET,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": DISCORD_REDIRECT_URI,
-            },
-        )
+    token_res = await client.post(
+        "https://discord.com/api/oauth2/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "client_id": client_id,
+            "client_secret": DISCORD_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": DISCORD_REDIRECT_URI,
+        },
+    )
     if token_res.status_code != 200:
-        raise HTTPException(status_code=401, detail=token_res.text)
+        raise HTTPException(status_code=401, detail="Failed to exchange code for token")
 
     token = token_res.json()
     access_token = token.get("access_token")
@@ -232,13 +317,12 @@ async def discord_callback(request: Request):
         raise HTTPException(status_code=401, detail="Missing access_token")
 
     # token -> user
-    async with httpx.AsyncClient(timeout=20) as client:
-        me_res = await client.get(
-            "https://discord.com/api/users/@me",
-            headers={"Authorization": f"{token_type} {access_token}"},
-        )
+    me_res = await client.get(
+        "https://discord.com/api/users/@me",
+        headers={"Authorization": f"{token_type} {access_token}"},
+    )
     if me_res.status_code != 200:
-        raise HTTPException(status_code=401, detail="Fetch /users/@me failed")
+        raise HTTPException(status_code=401, detail="Failed to fetch user info")
 
     me = me_res.json()
 
@@ -256,10 +340,8 @@ async def discord_callback(request: Request):
 
     res = RedirectResponse(FRONTEND_AFTER_LOGIN_URL, status_code=302)
 
-    # OAuth state cookie は消す
     res.delete_cookie("discord_oauth_state", path="/")
 
-    # ログインセッション cookie
     res.set_cookie(
         key="sid",
         value=_sign(sid),
@@ -283,12 +365,15 @@ async def health_memory():
     """メモリ使用状況を確認するエンドポイント"""
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
-    
+
+    instances = await get_bot_instances_cached()
+
     return {
         "rss": f"{mem_info.rss / 1024 / 1024:.2f} MB",
         "vms": f"{mem_info.vms / 1024 / 1024:.2f} MB",
         "guilds_cache_size": len(GUILDS_CACHE),
         "bot_guilds_cache_size": len(BOT_GUILDS_CACHE) if BOT_GUILDS_CACHE else 0,
+        "bot_instances_count": len(instances),
         "gc_objects_count": len(gc.get_objects())
     }
 
@@ -318,9 +403,7 @@ async def get_current_session(request: Request) -> db.WebSession:
 
 
 async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> list:
-    """
-    Fetch guilds from Discord or cache.
-    """
+    """Fetch guilds from Discord or cache."""
     if access_token in GUILDS_CACHE:
         return GUILDS_CACHE[access_token]
 
@@ -329,10 +412,12 @@ async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> lis
         headers={"Authorization": f"Bearer {access_token}"},
     )
     if res.status_code != 200:
-        raise HTTPException(status_code=res.status_code, detail=f"Failed to fetch guilds from Discord: {res.text}")
+        raise HTTPException(
+            status_code=res.status_code,
+            detail="Failed to fetch guilds from Discord"
+        )
 
     guilds = res.json()
-    # 必要なフィールドのみに絞る（id, name, icon, permissions, owner）
     minimal_guilds = [
         {
             "id": g.get("id"),
@@ -348,25 +433,21 @@ async def fetch_user_guilds(client: httpx.AsyncClient, access_token: str) -> lis
 
 
 async def fetch_bot_guilds(client: httpx.AsyncClient) -> list:
-    """
-    Fetch guilds where the bot is present.
-    """
+    """Fetch guilds where the bot is present."""
     global BOT_GUILDS_CACHE, BOT_GUILDS_CACHE_TS
     if not DISCORD_BOT_TOKEN:
         return []
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     if BOT_GUILDS_CACHE is not None and BOT_GUILDS_CACHE_TS:
         if (now - BOT_GUILDS_CACHE_TS).total_seconds() < BOT_GUILDS_CACHE_TTL:
             return BOT_GUILDS_CACHE
 
-    # Bot as user guilds
     res = await client.get(
         "https://discord.com/api/users/@me/guilds",
         headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
     )
     if res.status_code != 200:
-        # If it fails, we might just return the cached version or empty list
         if BOT_GUILDS_CACHE is not None:
             return BOT_GUILDS_CACHE
         return []
@@ -383,20 +464,16 @@ async def is_bot_in_guild(client: httpx.AsyncClient, guild_id: int) -> bool:
 
 
 async def require_manage_guild_permission(
-    request: Request,
-    sess: db.WebSession,
-    guild_id: int,
+        request: Request,
+        sess: db.WebSession,
+        guild_id: int,
 ) -> None:
-    """
-    Discordの /users/@me/guilds に含まれる permissions を見て、
-    対象guildで manage_guild(0x20) を持っている場合のみ許可する。
-    """
-    client: httpx.AsyncClient = request.app.state.http_client
+    """Check if user has manage_guild permission for the target guild."""
+    client = _get_http_client(request)
     user_guilds = await fetch_user_guilds(client, sess.access_token)
 
     target = next((g for g in user_guilds if str(g.get("id")) == str(guild_id)), None)
     if not target:
-        # 所属していない（または見えない）guild
         raise HTTPException(status_code=403, detail="Missing guild access")
 
     perms = int(target.get("permissions", 0))
@@ -408,24 +485,20 @@ async def require_manage_guild_permission(
 @app.get("/api/guilds")
 async def get_guilds(request: Request):
     sess = await get_current_session(request)
+    client = _get_http_client(request)
 
-    client: httpx.AsyncClient = request.app.state.http_client
-
-    # ユーザーの所属ギルド取得
     user_guilds = await fetch_user_guilds(client, sess.access_token)
 
-    # manage_guild を持つギルドのみ抽出 (MANAGE_GUILD = 0x20)
-    # または ADMINISTRATOR = 0x8, またはオーナー
     manageable_guilds = []
     for g in user_guilds:
         is_manageable = g.get("owner", False) or \
-                         (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or \
-                         (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
-        
+                        (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or \
+                        (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
+
         if is_manageable:
             guild_id = int(g["id"])
             bot_in_guild = await is_bot_in_guild(client, guild_id)
-            
+
             manageable_guilds.append({
                 "id": g["id"],
                 "name": g["name"],
@@ -442,38 +515,35 @@ async def unboost_guild(request: Request):
     sess = await get_current_session(request)
     payload = await request.json()
     guild_id = payload.get("guild_id")
-    
+
     if not guild_id:
         raise HTTPException(status_code=400, detail="guild_id is required")
-    
+
     try:
-        # 解除権限の確認: 自分のブーストであれば解除可能なので、
-        # ここで特別な権限チェックは不要（deactivate_guild_boostが自分のものかチェックする）
         success = await db.deactivate_guild_boost(int(guild_id), sess.discord_user_id)
         if not success:
             logger.warning(f"Unboost failed: No boost found for user {sess.discord_user_id} in guild {guild_id}")
             raise HTTPException(status_code=404, detail="Boost not found or not owned by you")
-        
+
         logger.info(f"User {sess.discord_user_id} successfully unboosted guild {guild_id}")
-        
-        # 最新のステータスを取得して返す（フロント更新のため）
+
         status = await db.get_user_billing(sess.discord_user_id)
         return {
             "ok": True,
             "total_slots": status["total_slots"] if status else 0,
             "used_slots": len(status["boosts"]) if status else 0
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error during unboost: {e}")
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
 
 @app.get("/api/billing/status")
 async def get_billing_status(request: Request):
     sess = await get_current_session(request)
-    
+
     status = await db.get_user_billing(sess.discord_user_id)
     if not status:
         status = {
@@ -481,12 +551,11 @@ async def get_billing_status(request: Request):
             "used_slots": 0,
             "boosts": []
         }
-    
-    # ギルド名の解決（フロントエンドでの表示用）
-    client: httpx.AsyncClient = request.app.state.http_client
+
+    client = _get_http_client(request)
     user_guilds = await fetch_user_guilds(client, sess.access_token)
     guild_map = {str(g["id"]): g["name"] for g in user_guilds}
-    
+
     boosts_with_names = []
     for b in status.get("boosts", []):
         guild_id_str = str(b["guild_id"])
@@ -495,32 +564,31 @@ async def get_billing_status(request: Request):
             "guild_name": guild_map.get(guild_id_str, "Unknown Server")
         })
 
-    # 管理可能なサーバー一覧の構築（ボット在席チェックとブースト数カウントを含む）
+    # Bot instances from database
+    instances = await get_bot_instances_cached()
+
     manageable_guilds = []
     for g in user_guilds:
         guild_id = int(g["id"])
         boost_count = await db.get_guild_boost_count(guild_id)
         bot_in_guild = await is_bot_in_guild(client, guild_id)
-        
-        # 表示条件: 1. Botが導入されている 2. 既にブーストされている
-        # プレミアムダッシュボードでは管理権限がなくてもBotがいれば表示する
+
         if bot_in_guild or boost_count > 0:
             is_manageable = g.get("owner", False) or \
-                             (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or \
-                             (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
-            
-            # 特典情報の構築
+                            (int(g["permissions"]) & MANAGE_GUILD) == MANAGE_GUILD or \
+                            (int(g["permissions"]) & ADMINISTRATOR) == ADMINISTRATOR
+
             benefits = []
             if boost_count >= 1:
                 benefits.append("Premium Features")
-            
+
             # サブBotの解放状況 (Index i のBotは i + 1 ブースト以上で有効)
-            instances = await db.get_bot_instances()
             for i, inst in enumerate(instances):
-                if i == 0: continue # メインBot
+                if i == 0:
+                    continue
                 if boost_count >= i + 1:
-                    benefits.append(f"Bot #{i+1} Unlocked")
-            
+                    benefits.append(f"{inst['bot_name']} Unlocked")
+
             manageable_guilds.append({
                 "id": g["id"],
                 "name": g["name"],
@@ -528,9 +596,9 @@ async def get_billing_status(request: Request):
                 "boost_count": boost_count,
                 "bot_in_guild": bot_in_guild,
                 "benefits": benefits,
-                "is_manageable": is_manageable # 権限情報も追加してフロントで制御しやすくする
+                "is_manageable": is_manageable
             })
-    
+
     return {
         "total_slots": status.get("total_slots", 0),
         "used_slots": status.get("used_slots") if "used_slots" in status else len(status.get("boosts", [])),
@@ -541,15 +609,27 @@ async def get_billing_status(request: Request):
 
 @app.get("/api/billing/config")
 async def get_billing_config():
-    instances = await db.get_bot_instances()
-    
-    # 1台目のID
+    """課金設定とBot一覧を返す"""
+    instances = await get_bot_instances_cached()
+
     client_id_0 = instances[0]["client_id"] if instances else None
-    
+
     return {
         "bot_instances": instances,
         "client_id_0": client_id_0,
-        "max_boosts_per_guild": len(instances)  # Bot台数を最大数とする
+        "max_boosts_per_guild": len(instances)
+    }
+
+
+@app.get("/api/bot-instances")
+async def get_bot_instances_api():
+    """
+    アクティブなBot一覧を取得するエンドポイント（フロントエンド用）
+    """
+    instances = await get_bot_instances_cached()
+    return {
+        "instances": instances,
+        "count": len(instances)
     }
 
 
@@ -558,37 +638,31 @@ async def boost_guild(request: Request):
     sess = await get_current_session(request)
     payload = await request.json()
     guild_id = payload.get("guild_id")
-    
+
     if not guild_id:
         raise HTTPException(status_code=400, detail="guild_id is required")
-    
-    # 権限チェックの緩和: 管理権限がなくても、Botが導入されていればブースト可能とする
-    client: httpx.AsyncClient = request.app.state.http_client
-    bot_in_guild = await is_bot_in_guild(client, int(guild_id))
-    
-    if not bot_in_guild:
-        # Botがいない場合は、管理権限が必要
-        await require_manage_guild_permission(request, sess, int(guild_id))
-    
-    # 現在のBot台数を取得
-    instances = await db.get_bot_instances()
-    max_boosts = len(instances)
 
-    # 最大ブースト数チェック
+    client = _get_http_client(request)
+    bot_in_guild = await is_bot_in_guild(client, int(guild_id))
+
+    if not bot_in_guild:
+        await require_manage_guild_permission(request, sess, int(guild_id))
+
+    # 最大ブースト数をDBから取得
+    max_boosts = await get_max_boosts_per_guild()
+
     boost_count = await db.get_guild_boost_count(int(guild_id))
     if boost_count >= max_boosts:
         raise HTTPException(status_code=400, detail=f"Guild reached max boost limit ({max_boosts})")
-        
-    # スロット空きチェック
+
     status = await db.get_user_billing(sess.discord_user_id)
     if not status or status["total_slots"] <= len(status["boosts"]):
         raise HTTPException(status_code=400, detail="No available slots")
-        
-    # 適用
+
     success = await db.activate_guild_boost(int(guild_id), sess.discord_user_id, max_boosts=max_boosts)
     if not success:
-        raise HTTPException(status_code=400, detail="Failed to activate boost (maybe no slots or limit reached)")
-        
+        raise HTTPException(status_code=400, detail="Failed to activate boost")
+
     return {"ok": True}
 
 
@@ -599,12 +673,10 @@ async def get_settings(guild_id: int, request: Request):
 
     settings = await db.get_guild_settings(guild_id)
     if not settings:
-        # Check if bot is in guild
-        client: httpx.AsyncClient = request.app.state.http_client
+        client = _get_http_client(request)
         if await is_bot_in_guild(client, guild_id):
             return DEFAULT_SETTINGS
         else:
-            # Bot not in guild, return empty to trigger invite screen
             return {}
     return settings
 
@@ -615,17 +687,13 @@ async def update_settings(guild_id: int, request: Request):
     await require_manage_guild_permission(request, sess, guild_id)
 
     new_settings = await request.json()
-    
-    # プレミアムチェック (文字数制限)
+
     boost_count = await db.get_guild_boost_count(guild_id)
     if boost_count < 1:
-        # 0ブーストの場合は50文字に強制制限
         if new_settings.get("max_chars", 0) > 50:
             new_settings["max_chars"] = 50
-        # 0ブーストの場合は自動接続を強制OFF
         new_settings["auto_join"] = False
     else:
-        # 1ブースト以上の場合は200文字に制限
         if new_settings.get("max_chars", 0) > 200:
             new_settings["max_chars"] = 200
 
@@ -639,7 +707,6 @@ async def get_dict(guild_id: int, request: Request):
     await require_manage_guild_permission(request, sess, guild_id)
 
     d = await db.get_guild_dict(guild_id)
-    # フロントエンドは [{word, reading}] のリストを期待している
     return [{"word": k, "reading": v} for k, v in d.items()]
 
 
@@ -656,14 +723,13 @@ async def add_dict(guild_id: int, request: Request):
         raise HTTPException(status_code=400, detail="word and reading are required")
 
     d = await db.get_guild_dict(guild_id)
-    
-    # プレミアムチェック (辞書登録数)
+
     boost_count = await db.get_guild_boost_count(guild_id)
     limit = 100 if boost_count >= 1 else 10
-    
+
     if len(d) >= limit and word not in d:
         raise HTTPException(
-            status_code=403, 
+            status_code=403,
             detail=f"Dictionary limit reached ({limit}). Upgrade to premium for more slots."
         )
 
@@ -688,18 +754,19 @@ async def delete_dict(guild_id: int, word: str, request: Request):
 
 @app.get("/api/billing/create-checkout-session")
 async def create_checkout_session_get():
-    raise HTTPException(status_code=405, detail="Checkout session creation requires a POST request. Please use the 'Buy' button in the dashboard.")
+    raise HTTPException(
+        status_code=405,
+        detail="Checkout session creation requires a POST request."
+    )
 
 
 @app.post("/api/billing/create-checkout-session")
 async def create_checkout_session(request: Request):
     sess = await get_current_session(request)
-    
+
     try:
-        # ユーザーが存在するか確認、なければ作成
         await db.create_or_update_user(sess.discord_user_id)
-        
-        # すでに Stripe Customer ID があるか取得
+
         user_billing = await db.get_user_billing(sess.discord_user_id)
         customer_id = user_billing.get("stripe_customer_id") if user_billing else None
 
@@ -724,10 +791,12 @@ async def create_checkout_session(request: Request):
             }
         )
         return {"url": checkout_session.url}
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error during checkout session creation: {e}")
+        raise HTTPException(status_code=500, detail="Payment service error")
     except Exception as e:
-        import traceback
-        traceback.print_exc()  # サーバーのコンソールにエラー詳細を表示
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Unexpected error during checkout session creation: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
 
 @app.post("/api/billing/webhook")
@@ -746,7 +815,6 @@ async def stripe_webhook(request: Request):
         logger.error(f"Webhook error: Invalid signature ({e})")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    # 冪等性のチェック
     event_id = event["id"]
     if await db.is_event_processed(event_id):
         logger.info(f"Event {event_id} already processed, skipping.")
@@ -754,43 +822,49 @@ async def stripe_webhook(request: Request):
 
     logger.info(f"Stripe Webhook received: {event['type']} (id: {event_id})")
 
-    # Handle the event
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        discord_id = session.get("metadata", {}).get("discord_id")
-        customer_id = session.get("customer")
-        
-        logger.info(f"Processing checkout.session.completed: discord_id={discord_id}, customer_id={customer_id}")
-        
-        if discord_id and customer_id:
-            # ユーザーとカスタマーIDを紐付け
-            await db.create_or_update_user(discord_id, customer_id)
-            # スロットを加算
-            await db.add_user_slots(customer_id, 1)
-            logger.info(f"Successfully updated slots for user {discord_id}")
-            await db.mark_event_processed(event_id)
-        else:
-            logger.warning("Missing discord_id or customer_id in session metadata")
+    try:
+        if event["type"] == "checkout.session.completed":
+            session = event["data"]["object"]
+            discord_id = session.get("metadata", {}).get("discord_id")
+            customer_id = session.get("customer")
 
-    elif event["type"] == "customer.subscription.deleted":
-        subscription = event["data"]["object"]
-        customer_id = subscription.get("customer")
-        logger.info(f"Processing customer.subscription.deleted: customer_id={customer_id}")
-        if customer_id:
-            await db.reset_user_slots_by_customer(customer_id)
-            logger.info(f"Successfully reset slots for customer {customer_id}")
-            await db.mark_event_processed(event_id)
+            logger.info(f"Processing checkout.session.completed: discord_id={discord_id}, customer_id={customer_id}")
 
-    elif event["type"] == "charge.refunded":
-        charge = event["data"]["object"]
-        customer_id = charge.get("customer")
-        logger.info(f"Processing charge.refunded: customer_id={customer_id}")
-        if customer_id:
-            res = await db.handle_refund_by_customer(customer_id)
-            if res:
-                logger.info(f"Refund handled for user {res['discord_id']}: {res['old_total']} -> {res['new_total']} slots. Removed boosts: {res['removed_guilds']}")
+            if discord_id and customer_id:
+                await db.create_or_update_user(discord_id, customer_id)
+                await db.add_user_slots(customer_id, 1)
                 await db.mark_event_processed(event_id)
+                logger.info(f"Successfully updated slots for user {discord_id}")
             else:
-                logger.warning(f"No user found for customer_id {customer_id} during refund")
+                logger.warning("Missing discord_id or customer_id in session metadata")
+
+        elif event["type"] == "customer.subscription.deleted":
+            subscription = event["data"]["object"]
+            customer_id = subscription.get("customer")
+            logger.info(f"Processing customer.subscription.deleted: customer_id={customer_id}")
+            if customer_id:
+                await db.reset_user_slots_by_customer(customer_id)
+                await db.mark_event_processed(event_id)
+                logger.info(f"Successfully reset slots for customer {customer_id}")
+
+        elif event["type"] == "charge.refunded":
+            charge = event["data"]["object"]
+            customer_id = charge.get("customer")
+            logger.info(f"Processing charge.refunded: customer_id={customer_id}")
+            if customer_id:
+                res = await db.handle_refund_by_customer(customer_id)
+                if res:
+                    logger.info(
+                        f"Refund handled for user {res['discord_id']}: "
+                        f"{res['old_total']} -> {res['new_total']} slots. "
+                        f"Removed boosts: {res['removed_guilds']}"
+                    )
+                    await db.mark_event_processed(event_id)
+                else:
+                    logger.warning(f"No user found for customer_id {customer_id} during refund")
+
+    except Exception as e:
+        logger.error(f"Error processing webhook event {event_id}: {e}")
+        raise HTTPException(status_code=500, detail="Webhook processing error")
 
     return {"status": "success"}
