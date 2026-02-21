@@ -3,12 +3,15 @@
 import logging
 import stripe
 from fastapi import APIRouter, Request, HTTPException
+from pydantic import ValidationError
 
 from src.core.config import MANAGE_GUILD, ADMINISTRATOR
+from src.core.models import BoostRequest
 from src.core.database import (
     get_user_billing,
     create_or_update_user,
     get_guild_boost_count,
+    get_guild_boost_counts_batch,
     activate_guild_boost,
     deactivate_guild_boost,
 )
@@ -19,7 +22,7 @@ from src.core.dependencies import (
 )
 from src.services.discord import (
     fetch_user_guilds,
-    is_bot_in_guild,
+    fetch_bot_guilds_as_set,
     get_bot_instances_cached,
     get_max_boosts_per_guild,
 )
@@ -60,12 +63,31 @@ async def get_billing_status(request: Request):
         })
 
     instances = await get_bot_instances_cached()
+    bot_guild_set = await fetch_bot_guilds_as_set(client)
+
+    # Collect guild IDs for batch query
+    guild_ids_to_check = []
+    for g in user_guilds:
+        guild_id = int(g["id"])
+        if str(guild_id) in bot_guild_set:
+            guild_ids_to_check.append(guild_id)
+
+    # Batch fetch boost counts
+    boost_counts = await get_guild_boost_counts_batch(guild_ids_to_check)
+
+    # Also include guilds with boosts that may not have the bot
+    boost_guild_ids = [int(b["guild_id"]) for b in status.get("boosts", [])]
+    additional_guild_ids = [gid for gid in boost_guild_ids if gid not in guild_ids_to_check]
+    if additional_guild_ids:
+        additional_counts = await get_guild_boost_counts_batch(additional_guild_ids)
+        boost_counts.update(additional_counts)
 
     manageable_guilds = []
     for g in user_guilds:
         guild_id = int(g["id"])
-        boost_count = await get_guild_boost_count(guild_id)
-        bot_in_guild = await is_bot_in_guild(client, guild_id)
+        guild_id_str = str(guild_id)
+        bot_in_guild = guild_id_str in bot_guild_set
+        boost_count = boost_counts.get(guild_id, 0)
 
         if bot_in_guild or boost_count > 0:
             is_manageable = g.get("owner", False) or \
@@ -136,7 +158,7 @@ async def create_checkout_session_endpoint(request: Request):
 
         url = await create_checkout_session(sess.discord_user_id, customer_id)
         return {"url": url}
-    except stripe.error.StripeError as e:
+    except stripe.StripeError as e:
         logger.error(f"Stripe error during checkout session creation: {e}")
         raise HTTPException(status_code=500, detail="Payment service error")
     except Exception as e:
@@ -148,21 +170,32 @@ async def create_checkout_session_endpoint(request: Request):
 async def boost_guild(request: Request):
     """Boost a guild."""
     sess = await get_current_session(request)
-    payload = await request.json()
-    guild_id = payload.get("guild_id")
 
-    if not guild_id:
-        raise HTTPException(status_code=400, detail="guild_id is required")
+    try:
+        raw_data = await request.json()
+        boost_req = BoostRequest(**raw_data)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
+    guild_id = boost_req.guild_id_int
     client = get_http_client(request)
-    bot_in_guild = await is_bot_in_guild(client, int(guild_id))
+    bot_guild_set = await fetch_bot_guilds_as_set(client)
+    bot_in_guild = str(guild_id) in bot_guild_set
+
+    # Always require manage_guild permission to boost
+    await require_manage_guild_permission(request, sess, guild_id)
 
     if not bot_in_guild:
-        await require_manage_guild_permission(request, sess, int(guild_id))
+        raise HTTPException(
+            status_code=400,
+            detail="Bot must be in the guild before boosting"
+        )
 
     max_boosts = await get_max_boosts_per_guild()
 
-    boost_count = await get_guild_boost_count(int(guild_id))
+    boost_count = await get_guild_boost_count(guild_id)
     if boost_count >= max_boosts:
         raise HTTPException(status_code=400, detail=f"Guild reached max boost limit ({max_boosts})")
 
@@ -170,7 +203,7 @@ async def boost_guild(request: Request):
     if not status or status["total_slots"] <= len(status["boosts"]):
         raise HTTPException(status_code=400, detail="No available slots")
 
-    success = await activate_guild_boost(int(guild_id), sess.discord_user_id, max_boosts=max_boosts)
+    success = await activate_guild_boost(guild_id, sess.discord_user_id, max_boosts=max_boosts)
     if not success:
         raise HTTPException(status_code=400, detail="Failed to activate boost")
 
@@ -181,14 +214,19 @@ async def boost_guild(request: Request):
 async def unboost_guild(request: Request):
     """Remove boost from a guild."""
     sess = await get_current_session(request)
-    payload = await request.json()
-    guild_id = payload.get("guild_id")
-
-    if not guild_id:
-        raise HTTPException(status_code=400, detail="guild_id is required")
 
     try:
-        success = await deactivate_guild_boost(int(guild_id), sess.discord_user_id)
+        raw_data = await request.json()
+        boost_req = BoostRequest(**raw_data)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    guild_id = boost_req.guild_id_int
+
+    try:
+        success = await deactivate_guild_boost(guild_id, sess.discord_user_id)
         if not success:
             logger.warning(f"Unboost failed: No boost found for user {sess.discord_user_id} in guild {guild_id}")
             raise HTTPException(status_code=404, detail="Boost not found or not owned by you")
@@ -219,7 +257,7 @@ async def stripe_webhook(request: Request):
     except ValueError:
         logger.error("Webhook error: Invalid payload")
         raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError as e:
+    except stripe.SignatureVerificationError as e:
         logger.error(f"Webhook error: Invalid signature ({e})")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
