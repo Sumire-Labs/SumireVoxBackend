@@ -15,7 +15,7 @@ from src.core.config import (
     SESSION_TTL_DAYS,
     COOKIE_SECURE,
 )
-from src.core.database import create_session, delete_session
+from src.core.db import create_session, delete_session
 from src.core.dependencies import (
     sign_value,
     verify_signed_value,

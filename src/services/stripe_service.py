@@ -5,7 +5,7 @@ import logging
 import stripe
 
 from src.core.config import STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_ID, DOMAIN
-from src.core.database import (
+from src.core.db import (
     create_or_update_user,
     add_user_slots,
     reset_user_slots_by_customer,

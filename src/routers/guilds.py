@@ -14,7 +14,7 @@ from src.core.config import (
     PREMIUM_DICT_LIMIT,
 )
 from src.core.models import GuildSettingsUpdate, DictEntry
-from src.core.database import (
+from src.core.db import (
     get_guild_settings,
     update_guild_settings,
     get_guild_dict,

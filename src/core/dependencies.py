@@ -6,7 +6,7 @@ from fastapi import Request, HTTPException
 import httpx
 
 from src.core.config import SESSION_SECRET, MANAGE_GUILD, ADMINISTRATOR
-from src.core.database import WebSession, get_session_by_sid
+from src.core.db import WebSession, get_session_by_sid
 from src.services.discord import fetch_user_guilds
 
 

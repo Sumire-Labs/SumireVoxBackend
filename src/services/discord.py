@@ -15,7 +15,7 @@ from src.core.config import (
     BOT_GUILDS_CACHE_TTL,
     BOT_INSTANCES_CACHE_TTL,
 )
-from src.core.database import get_bot_instances
+from src.core.db import get_bot_instances
 
 logger = logging.getLogger(__name__)
 

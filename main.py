@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.core.config import DATABASE_URL, get_allowed_origins, BOT_GUILDS_CACHE_TTL, BOT_INSTANCES_CACHE_TTL
-from src.core.database import init_db, close_db, cleanup_expired_sessions, get_bot_instances
+from src.core.db import init_db, close_db, cleanup_expired_sessions, get_bot_instances
 from src.services.discord import (
     clear_bot_guilds_cache,
     clear_bot_instances_cache,

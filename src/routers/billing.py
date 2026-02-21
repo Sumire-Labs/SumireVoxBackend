@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from src.core.config import MANAGE_GUILD, ADMINISTRATOR
 from src.core.models import BoostRequest
-from src.core.database import (
+from src.core.db import (
     get_user_billing,
     create_or_update_user,
     get_guild_boost_count,
