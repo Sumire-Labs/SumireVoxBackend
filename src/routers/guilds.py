@@ -3,6 +3,8 @@
 import logging
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import ValidationError
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from src.core.config import (
     DEFAULT_SETTINGS,
@@ -32,8 +34,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/guilds", tags=["guilds"])
 
+limiter = Limiter(key_func=get_remote_address)
+
 
 @router.get("")
+@limiter.limit("30/minute")
 async def get_guilds(request: Request):
     """Get all manageable guilds for the current user."""
     sess = await get_current_session(request)
@@ -64,6 +69,7 @@ async def get_guilds(request: Request):
 
 
 @router.get("/{guild_id}/settings")
+@limiter.limit("60/minute")
 async def get_settings(guild_id: int, request: Request):
     """Get guild settings."""
     sess = await get_current_session(request)
@@ -81,6 +87,7 @@ async def get_settings(guild_id: int, request: Request):
 
 
 @router.patch("/{guild_id}/settings")
+@limiter.limit("30/minute")
 async def update_settings_endpoint(guild_id: int, request: Request):
     """Update guild settings."""
     sess = await get_current_session(request)
@@ -92,32 +99,30 @@ async def update_settings_endpoint(guild_id: int, request: Request):
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors())
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid request")
 
-    # Get current settings and merge with updates
     current_settings = await get_guild_settings(guild_id)
     if not current_settings:
         current_settings = DEFAULT_SETTINGS.copy()
 
     new_settings = {**current_settings, **settings_update.to_update_dict()}
 
-    # Premium check
     boost_count = await get_guild_boost_count(guild_id)
     if boost_count < 1:
-        # Free tier limits
         if new_settings.get("max_chars", 0) > FREE_MAX_CHARS:
             new_settings["max_chars"] = FREE_MAX_CHARS
         new_settings["auto_join"] = False
     else:
-        # Premium tier limits
         if new_settings.get("max_chars", 0) > PREMIUM_MAX_CHARS:
             new_settings["max_chars"] = PREMIUM_MAX_CHARS
 
     await update_guild_settings(guild_id, new_settings)
+    logger.info(f"Settings updated for guild {guild_id} by user {sess.discord_user_id}")
     return {"ok": True}
 
 
 @router.get("/{guild_id}/dict")
+@limiter.limit("60/minute")
 async def get_dict(guild_id: int, request: Request):
     """Get guild dictionary."""
     sess = await get_current_session(request)
@@ -128,6 +133,7 @@ async def get_dict(guild_id: int, request: Request):
 
 
 @router.post("/{guild_id}/dict")
+@limiter.limit("30/minute")
 async def add_dict(guild_id: int, request: Request):
     """Add word to guild dictionary."""
     sess = await get_current_session(request)
@@ -139,11 +145,10 @@ async def add_dict(guild_id: int, request: Request):
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors())
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid request")
 
     d = await get_guild_dict(guild_id)
 
-    # Premium check
     boost_count = await get_guild_boost_count(guild_id)
     limit = PREMIUM_DICT_LIMIT if boost_count >= 1 else FREE_DICT_LIMIT
 
@@ -155,10 +160,12 @@ async def add_dict(guild_id: int, request: Request):
 
     d[entry.word] = entry.reading
     await update_guild_dict(guild_id, d)
+    logger.info(f"Dictionary updated for guild {guild_id}: added '{entry.word}'")
     return {"ok": True}
 
 
 @router.delete("/{guild_id}/dict/{word}")
+@limiter.limit("30/minute")
 async def delete_dict(guild_id: int, word: str, request: Request):
     """Delete word from guild dictionary."""
     sess = await get_current_session(request)
@@ -168,4 +175,5 @@ async def delete_dict(guild_id: int, word: str, request: Request):
     if word in d:
         del d[word]
         await update_guild_dict(guild_id, d)
+        logger.info(f"Dictionary updated for guild {guild_id}: deleted '{word}'")
     return {"ok": True}
