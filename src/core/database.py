@@ -595,3 +595,32 @@ async def healthcheck() -> dict[str, Any]:
     async with pool.acquire() as conn:
         value = await conn.fetchval("SELECT 1")
     return {"ok": value == 1}
+
+# 以下の関数を src/core/database.py に追加
+
+async def delete_user_sessions(discord_user_id: str) -> int:
+    """Delete all sessions for a specific user."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM web_sessions WHERE discord_user_id = $1",
+            discord_user_id,
+        )
+    try:
+        count = int(result.split()[-1])
+        if count > 0:
+            logger.info(f"Deleted {count} sessions for user {discord_user_id}")
+        return count
+    except Exception:
+        return 0
+
+
+async def get_user_session_count(discord_user_id: str) -> int:
+    """Get the number of active sessions for a user."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM web_sessions WHERE discord_user_id = $1 AND expires_at > now()",
+            discord_user_id,
+        )
+
