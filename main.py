@@ -193,9 +193,10 @@ async def get_bot_instances_details(request: Request):
         "count": len(instances)
     }
 
-
 @app.get("/api/me")
-async def api_me_redirect():
-    """Redirect to auth/me for backwards compatibility."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/auth/me", status_code=303)
+@limiter.limit("60/minute")
+async def api_me(request: Request):
+    """Get current user info (legacy endpoint)."""
+    sess = await get_current_session(request)
+    return {"user": {"discordId": sess.discord_user_id, "username": sess.username}}
+
