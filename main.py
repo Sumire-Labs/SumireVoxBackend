@@ -9,11 +9,17 @@ from contextlib import asynccontextmanager
 
 import psutil
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+from src.core.middleware import SecurityHeadersMiddleware, RequestLoggingMiddleware
 
 from src.core.config import DATABASE_URL, get_allowed_origins, BOT_GUILDS_CACHE_TTL, BOT_INSTANCES_CACHE_TTL
 from src.core.db import init_db, close_db, cleanup_expired_sessions, get_bot_instances
+from src.core.dependencies import get_current_session  # 追加
 from src.services.discord import (
     clear_bot_guilds_cache,
     clear_bot_instances_cache,
@@ -29,25 +35,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sumire-vox-backend")
 
+# レート制限の設定
+limiter = Limiter(key_func=get_remote_address)
+
 
 async def background_cleanup():
     """定期的に実行するクリーンアップタスク"""
     while True:
         try:
-            await asyncio.sleep(300)  # 5分ごとに実行
+            await asyncio.sleep(300)
             logger.info("定期クリーンアップを開始します...")
 
             now = datetime.now(timezone.utc)
 
-            # 1. キャッシュのクリア（TTLベース）
-            # Note: サービス層で自動的にTTL管理されているが、明示的にクリアも可能
-
-            # 2. 期限切れセッションと古い Stripe イベントの削除
             deleted_sessions = await cleanup_expired_sessions()
             if deleted_sessions > 0:
                 logger.info(f"期限切れのセッションを {deleted_sessions} 件削除しました。")
 
-            # 3. ガベージコレクションの強制実行
             gc.collect()
             logger.info("定期クリーンアップが完了しました。")
         except asyncio.CancelledError:
@@ -60,10 +64,8 @@ async def background_cleanup():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    # Startup
     await init_db(DATABASE_URL)
 
-    # Verify bot instances exist
     instances = await get_bot_instances()
     if not instances:
         logger.error("bot_instancesテーブルにアクティブなBotが登録されていません。")
@@ -75,16 +77,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"Primary bot client_id loaded: {instances[0]['client_id']}")
     logger.info(f"Total active bot instances: {len(instances)}")
 
-    # Start background task
     cleanup_task = asyncio.create_task(background_cleanup())
 
-    # Initialize HTTP client
     app.state.http_client = httpx.AsyncClient(timeout=20)
 
     try:
         yield
     finally:
-        # Shutdown
         cleanup_task.cancel()
         try:
             await cleanup_task
@@ -102,13 +101,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+    ],
+    expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
+    max_age=600,  # プリフライトリクエストのキャッシュ時間
 )
 
 # Include routers
@@ -119,14 +131,19 @@ app.include_router(billing_router)
 
 # Health check endpoints
 @app.get("/health")
-async def health():
+@limiter.limit("60/minute")
+async def health(request: Request):
     """Basic health check."""
     return {"status": "ok"}
 
 
 @app.get("/health/memory")
-async def health_memory():
-    """Memory usage health check."""
+@limiter.limit("10/minute")
+async def health_memory(request: Request):
+    """Memory usage health check - requires authentication."""
+    # 認証チェック
+    await get_current_session(request)
+
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
 
@@ -143,8 +160,33 @@ async def health_memory():
 
 
 @app.get("/api/bot-instances")
-async def get_bot_instances_api():
-    """Get active bot instances."""
+@limiter.limit("30/minute")
+async def get_bot_instances_api(request: Request):
+    """Get active bot instances (public info only)."""
+    instances = await get_bot_instances_cached()
+
+    # 公開しても安全な情報のみを返す
+    public_instances = [
+        {
+            "bot_name": inst["bot_name"],
+            "id": inst["id"],
+        }
+        for inst in instances
+    ]
+
+    return {
+        "instances": public_instances,
+        "count": len(public_instances)
+    }
+
+
+# 管理者用の詳細エンドポイント（認証必須）
+@app.get("/api/bot-instances/details")
+@limiter.limit("10/minute")
+async def get_bot_instances_details(request: Request):
+    """Get detailed bot instances info - requires authentication."""
+    await get_current_session(request)
+
     instances = await get_bot_instances_cached()
     return {
         "instances": instances,
@@ -152,7 +194,6 @@ async def get_bot_instances_api():
     }
 
 
-# For backwards compatibility with /api/me endpoint
 @app.get("/api/me")
 async def api_me_redirect():
     """Redirect to auth/me for backwards compatibility."""
