@@ -35,8 +35,8 @@ async def create_checkout_session(discord_user_id: str, customer_id: str | None)
                 },
             ],
             mode="subscription",
-            success_url=f"{DOMAIN}/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{DOMAIN}/dashboard",
+            success_url=f"{DOMAIN}/dashboard/premium?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{DOMAIN}/dashboard/premium",
             metadata={
                 "discord_id": discord_user_id
             },
