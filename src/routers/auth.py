@@ -61,7 +61,7 @@ async def discord_start(request: Request):
         value=sign_value(state),
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite="strict",  # 【修正】strictに変更
+        samesite="lax",
         path="/",
         max_age=60 * 10,
     )
