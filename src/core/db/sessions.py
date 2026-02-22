@@ -102,6 +102,33 @@ async def delete_session(sid: str) -> None:
         await conn.execute("DELETE FROM web_sessions WHERE sid = $1", sid)
 
 
+async def delete_user_sessions(discord_user_id: str) -> int:
+    """指定ユーザーのすべてのセッションを削除する（セッション固定攻撃対策）"""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM web_sessions WHERE discord_user_id = $1",
+            discord_user_id,
+        )
+    try:
+        count = int(result.split()[-1])
+        if count > 0:
+            logger.info(f"Deleted {count} sessions for user {discord_user_id}")
+        return count
+    except Exception:
+        return 0
+
+
+async def get_user_session_count(discord_user_id: str) -> int:
+    """ユーザーのアクティブセッション数を取得する"""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM web_sessions WHERE discord_user_id = $1 AND expires_at > now()",
+            discord_user_id,
+        )
+
+
 async def cleanup_expired_sessions(limit: int = 1000) -> int:
     """期限切れセッションと古いStripeイベントを削除する"""
     pool = _require_pool()

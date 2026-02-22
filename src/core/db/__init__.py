@@ -6,6 +6,8 @@ from src.core.db.sessions import (
     create_session,
     get_session_by_sid,
     delete_session,
+    delete_user_sessions,
+    get_user_session_count,
     cleanup_expired_sessions,
 )
 from src.core.db.guild_settings import (
@@ -49,6 +51,8 @@ __all__ = [
     "create_session",
     "get_session_by_sid",
     "delete_session",
+    "delete_user_sessions",
+    "get_user_session_count",
     "cleanup_expired_sessions",
     # guild_settings
     "get_guild_settings",
@@ -62,6 +66,7 @@ __all__ = [
     "add_user_slots",
     "reset_user_slots_by_customer",
     "handle_refund_by_customer",
+    "sync_user_slots",
     # guild_boosts
     "get_guild_boost_count",
     "get_guild_boost_counts_batch",
@@ -71,7 +76,6 @@ __all__ = [
     # stripe_events
     "is_event_processed",
     "mark_event_processed",
-    "sync_user_slots",
     # bot_instances
     "get_bot_instances",
 ]
