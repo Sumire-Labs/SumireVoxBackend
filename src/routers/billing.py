@@ -4,6 +4,8 @@ import logging
 import stripe
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import ValidationError
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from src.core.config import MANAGE_GUILD, ADMINISTRATOR
 from src.core.models import BoostRequest
@@ -36,8 +38,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
 
+limiter = Limiter(key_func=get_remote_address)
+
 
 @router.get("/status")
+@limiter.limit("30/minute")
 async def get_billing_status(request: Request):
     """Get billing status for current user."""
     sess = await get_current_session(request)
@@ -65,17 +70,14 @@ async def get_billing_status(request: Request):
     instances = await get_bot_instances_cached()
     bot_guild_set = await fetch_bot_guilds_as_set(client)
 
-    # Collect guild IDs for batch query
     guild_ids_to_check = []
     for g in user_guilds:
         guild_id = int(g["id"])
         if str(guild_id) in bot_guild_set:
             guild_ids_to_check.append(guild_id)
 
-    # Batch fetch boost counts
     boost_counts = await get_guild_boost_counts_batch(guild_ids_to_check)
 
-    # Also include guilds with boosts that may not have the bot
     boost_guild_ids = [int(b["guild_id"]) for b in status.get("boosts", [])]
     additional_guild_ids = [gid for gid in boost_guild_ids if gid not in guild_ids_to_check]
     if additional_guild_ids:
@@ -123,15 +125,14 @@ async def get_billing_status(request: Request):
 
 
 @router.get("/config")
-async def get_billing_config():
+@limiter.limit("30/minute")
+async def get_billing_config(request: Request):
     """Get billing configuration."""
     instances = await get_bot_instances_cached()
 
-    client_id_0 = instances[0]["client_id"] if instances else None
-
+    # 【修正】client_idは公開しない
     return {
-        "bot_instances": instances,
-        "client_id_0": client_id_0,
+        "bot_instances": [{"id": i["id"], "bot_name": i["bot_name"]} for i in instances],
         "max_boosts_per_guild": len(instances)
     }
 
@@ -146,6 +147,7 @@ async def create_checkout_session_get():
 
 
 @router.post("/create-checkout-session")
+@limiter.limit("5/minute")  # 決済は厳しく制限
 async def create_checkout_session_endpoint(request: Request):
     """Create a Stripe checkout session."""
     sess = await get_current_session(request)
@@ -167,6 +169,7 @@ async def create_checkout_session_endpoint(request: Request):
 
 
 @router.post("/boost")
+@limiter.limit("10/minute")
 async def boost_guild(request: Request):
     """Boost a guild."""
     sess = await get_current_session(request)
@@ -177,14 +180,13 @@ async def boost_guild(request: Request):
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors())
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid request")
 
     guild_id = boost_req.guild_id_int
     client = get_http_client(request)
     bot_guild_set = await fetch_bot_guilds_as_set(client)
     bot_in_guild = str(guild_id) in bot_guild_set
 
-    # Always require manage_guild permission to boost
     await require_manage_guild_permission(request, sess, guild_id)
 
     if not bot_in_guild:
@@ -207,10 +209,12 @@ async def boost_guild(request: Request):
     if not success:
         raise HTTPException(status_code=400, detail="Failed to activate boost")
 
+    logger.info(f"User {sess.discord_user_id} boosted guild {guild_id}")
     return {"ok": True}
 
 
 @router.post("/unboost")
+@limiter.limit("10/minute")
 async def unboost_guild(request: Request):
     """Remove boost from a guild."""
     sess = await get_current_session(request)
@@ -221,9 +225,13 @@ async def unboost_guild(request: Request):
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors())
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid request")
 
     guild_id = boost_req.guild_id_int
+
+    # 【修正】権限チェックを追加
+    # ユーザーは自分のブーストのみ解除可能だが、ギルドの管理権限も必要
+    await require_manage_guild_permission(request, sess, guild_id)
 
     try:
         success = await deactivate_guild_boost(guild_id, sess.discord_user_id)
@@ -247,10 +255,14 @@ async def unboost_guild(request: Request):
 
 
 @router.post("/webhook")
+@limiter.limit("100/minute")  # Webhookは適度に制限
 async def stripe_webhook(request: Request):
     """Handle Stripe webhook events."""
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
+
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing signature")
 
     try:
         event = verify_webhook_signature(payload, sig_header)
@@ -258,7 +270,7 @@ async def stripe_webhook(request: Request):
         logger.error("Webhook error: Invalid payload")
         raise HTTPException(status_code=400, detail="Invalid payload")
     except stripe.SignatureVerificationError as e:
-        logger.error(f"Webhook error: Invalid signature ({e})")
+        logger.error(f"Webhook error: Invalid signature")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     try:
