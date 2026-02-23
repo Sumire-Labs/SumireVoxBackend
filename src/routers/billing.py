@@ -187,7 +187,10 @@ async def boost_guild(request: Request):
     bot_guild_set = await fetch_bot_guilds_as_set(client)
     bot_in_guild = str(guild_id) in bot_guild_set
 
-    await require_manage_guild_permission(request, sess, guild_id)
+    user_guilds = await fetch_user_guilds(client, sess.access_token)
+    target_guild = next((g for g in user_guilds if str(g.get("id")) == str(guild_id)), None)
+    if not target_guild:
+        raise HTTPException(status_code=403, detail="You must be a member of the guild to boost it")
 
     if not bot_in_guild:
         raise HTTPException(
@@ -228,10 +231,12 @@ async def unboost_guild(request: Request):
         raise HTTPException(status_code=400, detail="Invalid request")
 
     guild_id = boost_req.guild_id_int
+    client = get_http_client(request)
 
-    # 【修正】権限チェックを追加
-    # ユーザーは自分のブーストのみ解除可能だが、ギルドの管理権限も必要
-    await require_manage_guild_permission(request, sess, guild_id)
+    user_guilds = await fetch_user_guilds(client, sess.access_token)
+    target_guild = next((g for g in user_guilds if str(g.get("id")) == str(guild_id)), None)
+    if not target_guild:
+        raise HTTPException(status_code=403, detail="You must be a member of the guild to boost it")
 
     try:
         success = await deactivate_guild_boost(guild_id, sess.discord_user_id)
