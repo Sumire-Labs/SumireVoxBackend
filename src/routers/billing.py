@@ -130,9 +130,15 @@ async def get_billing_config(request: Request):
     """Get billing configuration."""
     instances = await get_bot_instances_cached()
 
-    # 【修正】client_idは公開しない
     return {
-        "bot_instances": [{"id": i["id"], "bot_name": i["bot_name"]} for i in instances],
+        "bot_instances": [
+            {
+                "id": i["id"],
+                "bot_name": i["bot_name"],
+                "client_id": i["client_id"]
+            }
+            for i in instances
+        ],
         "max_boosts_per_guild": len(instances)
     }
 
