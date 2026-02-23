@@ -32,6 +32,11 @@ async def create_checkout_session(discord_user_id: str, customer_id: str | None)
                 {
                     "price": STRIPE_PRICE_ID,
                     "quantity": 1,
+                    "adjustable_quantity": {
+                        "enabled": True,
+                        "minimum": 1,
+                        "maximum": 10,
+                    },
                 },
             ],
             mode="subscription",
@@ -51,6 +56,7 @@ async def create_checkout_session(discord_user_id: str, customer_id: str | None)
     return checkout_session.url
 
 
+
 def verify_webhook_signature(payload: bytes, sig_header: str) -> dict:
     """
     Verify Stripe webhook signature and return the event.
@@ -68,6 +74,7 @@ async def handle_checkout_completed(event_id: str, session_data: dict) -> bool:
     """
     discord_id = session_data.get("metadata", {}).get("discord_id")
     customer_id = session_data.get("customer")
+    session_id = session_data.get("id")
 
     logger.info(f"Processing checkout.session.completed: discord_id={discord_id}, customer_id={customer_id}")
 
@@ -75,11 +82,18 @@ async def handle_checkout_completed(event_id: str, session_data: dict) -> bool:
         logger.warning("Missing discord_id or customer_id in session metadata")
         return False
 
+    # Checkout Sessionから購入数量を取得
+    def _get_quantity():
+        line_items = stripe.checkout.Session.list_line_items(session_id)
+        return sum(item.quantity for item in line_items.data)
+
+    quantity = await asyncio.to_thread(_get_quantity)
+
     await create_or_update_user(discord_id, customer_id)
-    await add_user_slots(customer_id, 1)
+    await add_user_slots(customer_id, quantity)  # 数量分のスロットを追加
     await mark_event_processed(event_id)
 
-    logger.info(f"Successfully updated slots for user {discord_id}")
+    logger.info(f"Successfully added {quantity} slot(s) for user {discord_id}")
     return True
 
 
