@@ -6,6 +6,8 @@ from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
+from src.core.config import IS_PRODUCTION
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,9 +24,18 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
+        # 【追加】Content-Security-Policy ヘッダー
+        csp_directives = [
+            "default-src 'none'",
+            "frame-ancestors 'none'",
+            "base-uri 'none'",
+            "form-action 'none'",
+        ]
+        response.headers["Content-Security-Policy"] = "; ".join(csp_directives)
+
         # HSTS (本番環境のみ)
-        if request.url.scheme == "https":
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        if request.url.scheme == "https" or IS_PRODUCTION:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
 
         return response
 
@@ -32,11 +43,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Log all requests for security monitoring."""
 
+    # 【追加】センシティブなパスのログ出力を制限
+    SENSITIVE_PATHS = {"/auth/discord/callback", "/api/billing/webhook"}
+
     async def dispatch(self, request: Request, call_next) -> Response:
         start_time = time.time()
 
-        # リクエスト情報をログ
         client_ip = request.client.host if request.client else "unknown"
+        path = request.url.path
 
         response = await call_next(request)
 
@@ -44,8 +58,14 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
         # 異常なリクエストを検出
         if response.status_code >= 400:
+            # 【変更】センシティブなパスの場合はクエリパラメータを隠す
+            if path in self.SENSITIVE_PATHS:
+                log_path = path
+            else:
+                log_path = str(request.url.path)
+
             logger.warning(
-                f"Request failed: {request.method} {request.url.path} "
+                f"Request failed: {request.method} {log_path} "
                 f"status={response.status_code} ip={client_ip} "
                 f"time={process_time:.3f}s"
             )

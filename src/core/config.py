@@ -21,13 +21,13 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 SESSION_SECRET = os.environ["SESSION_SECRET"]
 SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "7"))
 
-# 【修正】本番環境ではCOOKIE_SECUREを強制的にtrue
+# 本番環境ではCOOKIE_SECUREを強制的にtrue
 if IS_PRODUCTION:
     COOKIE_SECURE = True
 else:
     COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
 
-# 【追加】セッションの最大数制限
+# セッションの最大数制限
 MAX_SESSIONS_PER_USER = int(os.environ.get("MAX_SESSIONS_PER_USER", "5"))
 
 # Database
@@ -42,7 +42,7 @@ STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
 DOMAIN = os.environ.get("DOMAIN", "http://localhost:5173")
 FRONTEND_AFTER_LOGIN_URL = os.environ.get("FRONTEND_AFTER_LOGIN_URL", "https://sumirevox.com/")
 
-# 【追加】許可されたリダイレクトURLのバリデーション
+# 許可されたリダイレクトURLのバリデーション
 ALLOWED_REDIRECT_HOSTS = os.environ.get("ALLOWED_REDIRECT_HOSTS", "sumirevox.com,localhost").split(",")
 
 # Discord permissions
@@ -64,6 +64,7 @@ DEFAULT_MAX_BOOSTS_PER_GUILD = 3
 # Input validation limits
 MAX_DICT_WORD_LENGTH = 100
 MAX_DICT_READING_LENGTH = 200
+MAX_AUTO_JOIN_CONFIG_SIZE = 10000  # 追加: auto_join_config の最大サイズ
 
 # Default guild settings
 DEFAULT_SETTINGS = {
@@ -80,7 +81,16 @@ DEFAULT_SETTINGS = {
     "skip_urls": True,
 }
 
-# 【追加】レート制限設定
+# 追加: auto_join_config で許可されるキー
+ALLOWED_AUTO_JOIN_CONFIG_KEYS = {
+    "channel_id",
+    "text_channel_id",
+    "enabled",
+    "notify_on_join",
+    "notify_on_leave",
+}
+
+# レート制限設定
 RATE_LIMIT_DEFAULT = os.environ.get("RATE_LIMIT_DEFAULT", "60/minute")
 RATE_LIMIT_AUTH = os.environ.get("RATE_LIMIT_AUTH", "10/minute")
 RATE_LIMIT_PAYMENT = os.environ.get("RATE_LIMIT_PAYMENT", "5/minute")
@@ -94,6 +104,7 @@ def get_allowed_origins() -> list[str]:
             "http://localhost:5173",
             "http://127.0.0.1:5173",
         ])
+    logger.info(f"CORS allowed origins: {origins}")
     return origins
 
 
@@ -107,7 +118,7 @@ def validate_redirect_url(url: str) -> bool:
         return False
 
 
-# 【追加】起動時の設定検証
+# 起動時の設定検証
 def validate_config():
     """Validate critical configuration on startup."""
     errors = []

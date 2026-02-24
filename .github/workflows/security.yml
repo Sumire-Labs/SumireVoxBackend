@@ -25,7 +25,3 @@ jobs:
 
       - name: Run pip-audit
         run: pip-audit
-
-      - name: Run safety check
-        run: safety check -r requirements.txt
-        continue-on-error: true

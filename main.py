@@ -11,15 +11,22 @@ import psutil
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from src.core.middleware import SecurityHeadersMiddleware, RequestLoggingMiddleware
 
-from src.core.config import DATABASE_URL, get_allowed_origins, BOT_GUILDS_CACHE_TTL, BOT_INSTANCES_CACHE_TTL
+from src.core.config import (
+    DATABASE_URL,
+    get_allowed_origins,
+    BOT_GUILDS_CACHE_TTL,
+    BOT_INSTANCES_CACHE_TTL,
+    IS_PRODUCTION,
+)
 from src.core.db import init_db, close_db, cleanup_expired_sessions, get_bot_instances
-from src.core.dependencies import get_current_session  # 追加
+from src.core.dependencies import get_current_session
 from src.services.discord import (
     clear_bot_guilds_cache,
     clear_bot_instances_cache,
@@ -99,10 +106,45 @@ app = FastAPI(
     description="Backend API for SumireVox Discord Bot",
     version="1.0.0",
     lifespan=lifespan,
+    # 本番環境ではドキュメントを無効化（オプション）
+    docs_url=None if IS_PRODUCTION else "/docs",
+    redoc_url=None if IS_PRODUCTION else "/redoc",
+    openapi_url=None if IS_PRODUCTION else "/openapi.json",
 )
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# グローバル例外ハンドラ（本番環境で内部エラーを隠す）
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle uncaught exceptions."""
+    logger.error(
+        f"Unhandled exception: {type(exc).__name__}: {exc}",
+        exc_info=True,
+        extra={
+            "path": request.url.path,
+            "method": request.method,
+        }
+    )
+
+    if IS_PRODUCTION:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"}
+        )
+
+    # 開発環境ではエラー詳細を返す
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error": str(exc),
+            "type": type(exc).__name__,
+        }
+    )
+
 
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
@@ -120,7 +162,7 @@ app.add_middleware(
         "X-Requested-With",
     ],
     expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
-    max_age=600,  # プリフライトリクエストのキャッシュ時間
+    max_age=600,
 )
 
 # Include routers
@@ -141,7 +183,6 @@ async def health(request: Request):
 @limiter.limit("10/minute")
 async def health_memory(request: Request):
     """Memory usage health check - requires authentication."""
-    # 認証チェック
     await get_current_session(request)
 
     process = psutil.Process(os.getpid())
@@ -165,7 +206,6 @@ async def get_bot_instances_api(request: Request):
     """Get active bot instances (public info only)."""
     instances = await get_bot_instances_cached()
 
-    # 公開しても安全な情報のみを返す
     public_instances = [
         {
             "bot_name": inst["bot_name"],
@@ -180,7 +220,6 @@ async def get_bot_instances_api(request: Request):
     }
 
 
-# 管理者用の詳細エンドポイント（認証必須）
 @app.get("/api/bot-instances/details")
 @limiter.limit("10/minute")
 async def get_bot_instances_details(request: Request):
@@ -193,6 +232,7 @@ async def get_bot_instances_details(request: Request):
         "count": len(instances)
     }
 
+
 @app.get("/api/me")
 @limiter.limit("60/minute")
 async def api_me(request: Request):
@@ -200,3 +240,30 @@ async def api_me(request: Request):
     sess = await get_current_session(request)
     return {"user": {"discordId": sess.discord_user_id, "username": sess.username}}
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle uncaught exceptions."""
+    logger.error(
+        f"Unhandled exception: {type(exc).__name__}: {exc}",
+        exc_info=True,
+        extra={
+            "path": request.url.path,
+            "method": request.method,
+        }
+    )
+
+    if IS_PRODUCTION:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"}
+        )
+
+    # 開発環境ではエラー詳細を返す
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error": str(exc),
+            "type": type(exc).__name__,
+        }
+    )
