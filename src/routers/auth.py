@@ -27,6 +27,8 @@ from src.core.dependencies import (
 )
 from src.services.discord import get_primary_bot_client_id
 
+COOKIE_DOMAIN = ".sumirevox.com"
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -157,7 +159,8 @@ async def discord_callback(request: Request):
         value=sign_value(sid),
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite="strict",  # 【修正】strictに変更
+        samesite="none",
+        domain=COOKIE_DOMAIN,
         path="/",
         max_age=60 * 60 * 24 * SESSION_TTL_DAYS,
     )
