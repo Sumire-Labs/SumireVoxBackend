@@ -8,17 +8,9 @@ from src.core.config import (
     PREMIUM_MAX_CHARS,
     MAX_DICT_WORD_LENGTH,
     MAX_DICT_READING_LENGTH,
+    MAX_AUTO_JOIN_CONFIG_SIZE,
+    ALLOWED_AUTO_JOIN_CONFIG_KEYS,
 )
-
-# auto_join_config の制限
-MAX_AUTO_JOIN_CONFIG_SIZE = 10000
-ALLOWED_AUTO_JOIN_CONFIG_KEYS = {
-    "channel_id",
-    "text_channel_id",
-    "enabled",
-    "notify_on_join",
-    "notify_on_leave",
-}
 
 
 class GuildSettingsUpdate(BaseModel):

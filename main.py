@@ -239,31 +239,3 @@ async def api_me(request: Request):
     """Get current user info (legacy endpoint)."""
     sess = await get_current_session(request)
     return {"user": {"discordId": sess.discord_user_id, "username": sess.username}}
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """Handle uncaught exceptions."""
-    logger.error(
-        f"Unhandled exception: {type(exc).__name__}: {exc}",
-        exc_info=True,
-        extra={
-            "path": request.url.path,
-            "method": request.method,
-        }
-    )
-
-    if IS_PRODUCTION:
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error"}
-        )
-
-    # 開発環境ではエラー詳細を返す
-    return JSONResponse(
-        status_code=500,
-        content={
-            "detail": "Internal server error",
-            "error": str(exc),
-            "type": type(exc).__name__,
-        }
-    )
