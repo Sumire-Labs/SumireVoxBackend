@@ -75,7 +75,6 @@ async def discord_callback(request: Request):
     error = request.query_params.get("error")
     if error:
         logger.warning(f"Discord OAuth error: {error}")
-        # 【修正】エラーの詳細を隠す
         raise HTTPException(status_code=400, detail="Authentication failed")
 
     code = request.query_params.get("code")
