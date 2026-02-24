@@ -24,15 +24,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
-        # 【追加】Content-Security-Policy ヘッダー
-        csp_directives = [
-            "default-src 'none'",
-            "frame-ancestors 'none'",
-            "base-uri 'none'",
-            "form-action 'none'",
-        ]
-        response.headers["Content-Security-Policy"] = "; ".join(csp_directives)
-
         # HSTS (本番環境のみ)
         if request.url.scheme == "https" or IS_PRODUCTION:
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
