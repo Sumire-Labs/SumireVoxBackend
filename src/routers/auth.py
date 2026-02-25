@@ -154,16 +154,27 @@ async def discord_callback(request: Request):
 
     res = RedirectResponse(FRONTEND_AFTER_LOGIN_URL, status_code=302)
     res.delete_cookie("discord_oauth_state", path="/")
-    res.set_cookie(
-        key="sid",
-        value=sign_value(sid),
-        httponly=True,
-        secure=COOKIE_SECURE,
-        samesite="none",
-        domain=COOKIE_DOMAIN,
-        path="/",
-        max_age=60 * 60 * 24 * SESSION_TTL_DAYS,
-    )
+    if IS_PRODUCTION:
+        res.set_cookie(
+            key="sid",
+            value=sign_value(sid),
+            httponly=True,
+            secure=True,
+            samesite="none",
+            domain=COOKIE_DOMAIN,  # 本番のみ
+            path="/",
+            max_age=60 * 60 * 24 * SESSION_TTL_DAYS,
+        )
+    else:
+        res.set_cookie(
+            key="sid",
+            value=sign_value(sid),
+            httponly=True,
+            secure=False,
+            samesite="lax",  # 開発環境ではlax
+            path="/",
+            max_age=60 * 60 * 24 * SESSION_TTL_DAYS,
+        )
 
     logger.info(f"User {discord_user_id} logged in successfully")
     return res
